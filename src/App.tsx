@@ -5,6 +5,8 @@ import {
   canvasToDataUrl,
   captureVideoFrame,
   createId,
+  detectInkBoundingRegion,
+  cropCanvasToRegion,
   drawImageToCanvas,
   fileToDataUrl,
   getImageData
@@ -94,12 +96,20 @@ const proeaTemplatePresets: Array<
   columnCount: questionCount === 27 ? 3 : 4,
   rowGapRatio: 0.015,
   columnGapRatio: 0.045,
-  region: {
-    x: 0.2,
-    y: 0.18,
-    width: 0.62,
-    height: 0.68
-  },
+  region:
+    questionCount === 27
+      ? {
+          x: 0.14,
+          y: 0.624,
+          width: 0.793,
+          height: 0.266
+        }
+      : {
+          x: 0.121,
+          y: 0.645,
+          width: 0.83,
+          height: 0.228
+        },
   threshold: 31,
   minConfidence: 0.11
 }));
@@ -469,14 +479,50 @@ export default function App() {
     }
 
     const normalizedCanvas = await normalizeCanvasWithOpenCv(canvas, templateForAnalysis);
-    const imageData = getImageData(normalizedCanvas);
+    setBusyMessage("Detectando o retangulo exato do campo do gabarito...");
+    const detectedAnswerRegion = detectInkBoundingRegion(
+      normalizedCanvas,
+      templateForAnalysis.region,
+      templateForAnalysis.questionCount === 27
+        ? {
+            expandX: 0.035,
+            expandY: 0.045,
+            minRowInk: 0.055,
+            minColInk: 0.05,
+            minWidthRatio: 0.62,
+            minHeightRatio: 0.7,
+            padX: 0.008,
+            padY: 0.01
+          }
+        : {
+            expandX: 0.04,
+            expandY: 0.04,
+            minRowInk: 0.055,
+            minColInk: 0.05,
+            minWidthRatio: 0.72,
+            minHeightRatio: 0.62,
+            padX: 0.008,
+            padY: 0.01
+          }
+    );
+    setBusyMessage("Recortando apenas o campo detectado do gabarito...");
+    const answerRegionCanvas = cropCanvasToRegion(normalizedCanvas, detectedAnswerRegion);
+    const imageData = getImageData(answerRegionCanvas);
     const worker = await getScanWorker();
     setBusyMessage("Lendo regioes de resposta do modelo calibrado...");
     const analysis = await worker.analyze({
       pixels: imageData.data,
       width: imageData.width,
       height: imageData.height,
-      template: templateForAnalysis
+      template: {
+        ...templateForAnalysis,
+        region: {
+          x: 0,
+          y: 0,
+          width: 1,
+          height: 1
+        }
+      }
     });
     const score = scoreAnswers(analysis.detectedAnswers, selectedLot.answerKey);
     const nextPending: PendingScan = {
@@ -484,7 +530,7 @@ export default function App() {
       template: templateForAnalysis,
       detectedBookletCode: bookletDetection.code ?? undefined,
       imageUrl: dataUrl,
-      normalizedImage: canvasToDataUrl(normalizedCanvas),
+      normalizedImage: canvasToDataUrl(answerRegionCanvas),
       detectedAnswers: analysis.detectedAnswers,
       finalAnswers: [...analysis.detectedAnswers],
       ambiguousQuestions: analysis.ambiguousQuestions,
@@ -1084,6 +1130,9 @@ export default function App() {
                   {pendingScan.detectedBookletCode
                     ? ` • codigo detectado ${pendingScan.detectedBookletCode}`
                     : " • codigo do caderno nao detectado, usando modelo atual do lote"}
+                </p>
+                <p>
+                  A leitura foi executada somente no retangulo detectado do bloco do gabarito, sem processar a folha inteira.
                 </p>
               </div>
 
