@@ -67,9 +67,43 @@ type CaptureDraft = {
   confirmedCrop: CropRect;
 };
 
+type OperationFlow =
+  | {
+      phase: "idle";
+      statusText: string;
+      detailText: string;
+    }
+  | {
+      phase: "photo_loaded" | "crop_editing";
+      statusText: string;
+      detailText: string;
+      capture: CaptureDraft;
+      warningText?: string;
+    }
+  | {
+      phase: "analyzing";
+      statusText: string;
+      detailText: string;
+      capture: CaptureDraft;
+    }
+  | {
+      phase: "reviewing";
+      statusText: string;
+      detailText: string;
+      review: PendingScan;
+      warningText?: string;
+    }
+  | {
+      phase: "saving";
+      statusText: string;
+      detailText: string;
+      review: PendingScan;
+    };
+
 type DragMode = "move" | "se" | "sw" | "ne" | "nw";
 
 const MIN_CROP_SIZE = 0.16;
+const MIN_IMAGE_EDGE = 640;
 
 const defaultTemplateDraft: TemplateDraft = {
   name: "",
@@ -189,23 +223,20 @@ export default function App() {
   const [busyMessage, setBusyMessage] = useState("");
   const [notice, setNotice] = useState("");
   const [activeView, setActiveView] = useState<AppView>("operacao");
-  const [captureMessage, setCaptureMessage] = useState(
-    "Escolha um lote e fotografe somente a area do gabarito."
-  );
   const [selectedStudentId, setSelectedStudentId] = useState("");
   const [activePreviewTemplateId, setActivePreviewTemplateId] = useState("");
-  const [captureDraft, setCaptureDraft] = useState<CaptureDraft | null>(null);
-  const [operationStage, setOperationStage] = useState<
-    "idle" | "photo-received" | "crop-ready" | "analyzing" | "review-ready"
-  >("idle");
+  const [operationFlow, setOperationFlow] = useState<OperationFlow>({
+    phase: "idle",
+    statusText: "Pronto para fotografar",
+    detailText: "Escolha um lote e fotografe somente a area do gabarito."
+  });
   const selectedLotId = useAppStore((state) => state.selectedLotId);
-  const pendingScan = useAppStore((state) => state.pendingScan);
   const setSelectedLotId = useAppStore((state) => state.setSelectedLotId);
-  const setPendingScan = useAppStore((state) => state.setPendingScan);
   const captureInputRef = useRef<HTMLInputElement | null>(null);
   const galleryInputRef = useRef<HTMLInputElement | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const operationFocusRef = useRef<HTMLDivElement | null>(null);
+  const analysisLockRef = useRef(false);
 
   const selectedLot = useMemo(
     () => lots.find((lot) => lot.id === selectedLotId) ?? null,
@@ -268,7 +299,7 @@ export default function App() {
   }, [selectedLotId, setSelectedLotId]);
 
   useEffect(() => {
-    if (!captureDraft && !pendingScan) {
+    if (operationFlow.phase === "idle") {
       return;
     }
     const node = operationFocusRef.current;
@@ -278,7 +309,7 @@ export default function App() {
     window.setTimeout(() => {
       node.scrollIntoView({ behavior: "smooth", block: "start" });
     }, 120);
-  }, [captureDraft, pendingScan]);
+  }, [operationFlow]);
 
   async function refreshAll() {
     const [nextTemplates, nextLots, nextStudents, nextScans] = await Promise.all([
@@ -386,11 +417,18 @@ export default function App() {
     if (!selectedLot || !selectedTemplate) {
       throw new Error("Escolha um lote com modelo definido antes de fotografar.");
     }
+    if (!file.type.startsWith("image/")) {
+      throw new Error("O arquivo enviado precisa ser uma imagem.");
+    }
 
-    setOperationStage("photo-received");
+    setNotice("");
     setBusyMessage("Preparando a foto do gabarito...");
     const imageUrl = await fileToDataUrl(file);
     const originalCanvas = await drawImageToCanvas(imageUrl);
+    if (Math.min(originalCanvas.width, originalCanvas.height) < MIN_IMAGE_EDGE) {
+      throw new Error("A foto ficou pequena demais. Refaça a captura mais de perto e com melhor nitidez.");
+    }
+
     const normalizedCanvas = await normalizeCanvasWithOpenCv(originalCanvas, selectedTemplate);
     const suggestedCrop = clampCrop(
       detectInkBoundingRegion(normalizedCanvas, selectedTemplate.region, {
@@ -404,8 +442,13 @@ export default function App() {
         padY: 0.01
       })
     );
+    const fallbackCropUsed =
+      Math.abs(suggestedCrop.x - selectedTemplate.region.x) < 0.001 &&
+      Math.abs(suggestedCrop.y - selectedTemplate.region.y) < 0.001 &&
+      Math.abs(suggestedCrop.width - selectedTemplate.region.width) < 0.001 &&
+      Math.abs(suggestedCrop.height - selectedTemplate.region.height) < 0.001;
 
-    setCaptureDraft({
+    const capture: CaptureDraft = {
       lot: selectedLot,
       template: selectedTemplate,
       fileName: file.name || "foto-do-gabarito.jpg",
@@ -414,73 +457,113 @@ export default function App() {
       normalizedImage: canvasToDataUrl(normalizedCanvas),
       suggestedCrop,
       confirmedCrop: suggestedCrop
-    });
+    };
+
     setBusyMessage("");
     setNotice("Foto recebida com sucesso. Agora ajuste o recorte do gabarito.");
-    setOperationStage("crop-ready");
-    setCaptureMessage("Ajuste o recorte para conter apenas o bloco do gabarito e confirme a analise.");
-    setPendingScan(null);
+    setOperationFlow({
+      phase: "crop_editing",
+      statusText: "Foto recebida",
+      detailText: "Ajuste o quadro para conter somente a grade de respostas e toque em Analisar gabarito.",
+      capture,
+      warningText: fallbackCropUsed
+        ? "Nao localizamos o gabarito automaticamente; ajuste manualmente o quadro."
+        : undefined
+    });
     setSelectedStudentId("");
   }
 
   async function analyzeConfirmedCrop() {
-    if (!captureDraft) {
+    if (operationFlow.phase !== "crop_editing" && operationFlow.phase !== "photo_loaded") {
       return;
     }
+    if (analysisLockRef.current) {
+      return;
+    }
+    analysisLockRef.current = true;
+    const capture = operationFlow.capture;
 
-    setOperationStage("analyzing");
-    setBusyMessage("Recortando o bloco confirmado do gabarito...");
-    const normalizedCanvas = await drawImageToCanvas(captureDraft.normalizedImage);
-    const finalCrop = clampCrop(captureDraft.confirmedCrop);
-    const answerRegionCanvas = cropCanvasToRegion(normalizedCanvas, finalCrop);
-    const imageData = getImageData(answerRegionCanvas);
-    const worker = await getScanWorker();
-    setBusyMessage("Lendo as respostas marcadas...");
-    const analysis = await worker.analyze({
-      pixels: imageData.data,
-      width: imageData.width,
-      height: imageData.height,
-      template: {
-        ...captureDraft.template,
-        region: {
-          x: 0,
-          y: 0,
-          width: 1,
-          height: 1
+    try {
+      setOperationFlow({
+        phase: "analyzing",
+        statusText: "Analisando respostas",
+        detailText: "Aguarde enquanto o app recorta o gabarito e identifica as alternativas marcadas.",
+        capture
+      });
+      setBusyMessage("Recortando o bloco confirmado do gabarito...");
+      const normalizedCanvas = await drawImageToCanvas(capture.normalizedImage);
+      const finalCrop = clampCrop(capture.confirmedCrop);
+      const answerRegionCanvas = cropCanvasToRegion(normalizedCanvas, finalCrop);
+      const imageData = getImageData(answerRegionCanvas);
+      const worker = await getScanWorker();
+      setBusyMessage("Lendo as respostas marcadas...");
+      const analysis = await worker.analyze({
+        pixels: imageData.data,
+        width: imageData.width,
+        height: imageData.height,
+        template: {
+          ...capture.template,
+          region: {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1
+          }
         }
-      }
-    });
+      });
 
-    const score = scoreAnswers(analysis.detectedAnswers, captureDraft.lot.answerKey);
-    const nextPending: PendingScan = {
-      lot: captureDraft.lot,
-      template: captureDraft.template,
-      imageUrl: captureDraft.imageUrl,
-      normalizedImage: canvasToDataUrl(answerRegionCanvas),
-      suggestedCrop: captureDraft.suggestedCrop,
-      confirmedCrop: finalCrop,
-      detectedAnswers: analysis.detectedAnswers,
-      finalAnswers: [...analysis.detectedAnswers],
-      ambiguousQuestions: analysis.ambiguousQuestions,
-      blanks: analysis.blanks,
-      correctCount: score.correctCount,
-      percent: score.percent,
-      confidence: analysis.confidence
-    };
+      const score = scoreAnswers(analysis.detectedAnswers, capture.lot.answerKey);
+      const nextPending: PendingScan = {
+        lot: capture.lot,
+        template: capture.template,
+        imageUrl: capture.imageUrl,
+        normalizedImage: canvasToDataUrl(answerRegionCanvas),
+        suggestedCrop: capture.suggestedCrop,
+        confirmedCrop: finalCrop,
+        detectedAnswers: analysis.detectedAnswers,
+        finalAnswers: [...analysis.detectedAnswers],
+        ambiguousQuestions: analysis.ambiguousQuestions,
+        blanks: analysis.blanks,
+        correctCount: score.correctCount,
+        percent: score.percent,
+        confidence: analysis.confidence
+      };
 
-    setPendingScan(nextPending);
-    setCaptureDraft(null);
-    setBusyMessage("");
-    setNotice("Analise concluida. Confira as respostas detectadas abaixo.");
-    setOperationStage("review-ready");
-    setCaptureMessage("Leitura pronta. Confira as respostas e confirme o aluno.");
+      const lowConfidence =
+        analysis.confidence < 0.2 ||
+        analysis.blanks.length > Math.ceil(capture.template.questionCount * 0.3);
+
+      setBusyMessage("");
+      setNotice("Analise concluida. Confira as respostas detectadas abaixo.");
+      setOperationFlow({
+        phase: "reviewing",
+        statusText: "Leitura pronta",
+        detailText: "Confira as respostas, selecione o aluno e confirme para salvar a leitura.",
+        review: nextPending,
+        warningText: lowConfidence
+          ? "A leitura voltou com baixa confianca ou muitos brancos. Revise com cuidado antes de salvar."
+          : undefined
+      });
+    } finally {
+      analysisLockRef.current = false;
+    }
   }
 
   async function confirmPendingScan() {
-    if (!pendingScan || !selectedStudentId) {
+    if (operationFlow.phase !== "reviewing" && operationFlow.phase !== "saving") {
       return;
     }
+    if (!selectedStudentId) {
+      return;
+    }
+    const pendingScan = operationFlow.review;
 
+    setOperationFlow({
+      phase: "saving",
+      statusText: "Salvando leitura",
+      detailText: "A leitura esta sendo gravada na base local.",
+      review: pendingScan
+    });
     const score = scoreAnswers(pendingScan.finalAnswers, pendingScan.lot.answerKey);
     const scan: ScanRecord = {
       id: createId("scan"),
@@ -501,26 +584,32 @@ export default function App() {
     };
 
     await db.scans.put(scan);
-    setPendingScan(null);
     setSelectedStudentId("");
     setNotice("Leitura confirmada e salva na base local.");
-    setOperationStage("idle");
-    setCaptureMessage("Leitura salva. Fotografe o proximo gabarito.");
+    setOperationFlow({
+      phase: "idle",
+      statusText: "Pronto para fotografar",
+      detailText: "Leitura salva. Fotografe o proximo gabarito."
+    });
     await refreshAll();
   }
 
   function updatePendingAnswer(questionIndex: number, answer: AlternativeLabel) {
-    if (!pendingScan) {
+    if (operationFlow.phase !== "reviewing") {
       return;
     }
+    const pendingScan = operationFlow.review;
     const nextAnswers = [...pendingScan.finalAnswers];
     nextAnswers[questionIndex] = answer;
     const score = scoreAnswers(nextAnswers, pendingScan.lot.answerKey);
-    setPendingScan({
-      ...pendingScan,
-      finalAnswers: nextAnswers,
-      correctCount: score.correctCount,
-      percent: score.percent
+    setOperationFlow({
+      ...operationFlow,
+      review: {
+        ...pendingScan,
+        finalAnswers: nextAnswers,
+        correctCount: score.correctCount,
+        percent: score.percent
+      }
     });
   }
 
@@ -553,7 +642,12 @@ export default function App() {
       const message = error instanceof Error ? error.message : "Ocorreu um erro inesperado.";
       setNotice(message);
       setBusyMessage("");
-      setOperationStage("idle");
+      setOperationFlow({
+        phase: "idle",
+        statusText: "Pronto para fotografar",
+        detailText: "Houve um erro na operacao. Tente fotografar novamente."
+      });
+      analysisLockRef.current = false;
       console.error(error);
     }
   }
@@ -639,10 +733,10 @@ export default function App() {
             description="Use a camera nativa do iPhone ou a galeria. A foto deve mostrar somente a area do gabarito."
           >
             <div className="stage-strip">
-              <div className={`stage-pill ${operationStage === "idle" ? "active" : ""}`}>1. Foto</div>
-              <div className={`stage-pill ${operationStage === "photo-received" || operationStage === "crop-ready" ? "active" : ""}`}>2. Recorte</div>
-              <div className={`stage-pill ${operationStage === "analyzing" ? "active" : ""}`}>3. Analise</div>
-              <div className={`stage-pill ${operationStage === "review-ready" ? "active" : ""}`}>4. Revisao</div>
+              <div className={`stage-pill ${operationFlow.phase === "idle" ? "active" : ""}`}>1. Foto</div>
+              <div className={`stage-pill ${operationFlow.phase === "photo_loaded" || operationFlow.phase === "crop_editing" ? "active" : ""}`}>2. Recorte</div>
+              <div className={`stage-pill ${operationFlow.phase === "analyzing" ? "active" : ""}`}>3. Analise</div>
+              <div className={`stage-pill ${operationFlow.phase === "reviewing" || operationFlow.phase === "saving" ? "active" : ""}`}>4. Revisao</div>
             </div>
 
             <div className="operation-banner three">
@@ -663,14 +757,14 @@ export default function App() {
             <div className="capture-toolbar">
               <button
                 className="primary"
-                disabled={!selectedLot || !selectedTemplate || Boolean(captureDraft)}
+                disabled={!selectedLot || !selectedTemplate || operationFlow.phase !== "idle"}
                 onClick={() => captureInputRef.current?.click()}
               >
                 Fotografar gabarito
               </button>
               <button
                 className="secondary"
-                disabled={!selectedLot || !selectedTemplate || Boolean(captureDraft)}
+                disabled={!selectedLot || !selectedTemplate || operationFlow.phase !== "idle"}
                 onClick={() => galleryInputRef.current?.click()}
               >
                 Escolher da galeria
@@ -715,7 +809,7 @@ export default function App() {
               </div>
               <div>
                 <strong>Como fotografar</strong>
-                <p>{captureMessage}</p>
+                <p>{operationFlow.detailText}</p>
                 {busyMessage ? <p className="hint">{busyMessage}</p> : null}
                 <p className="hint">
                   Evite fotografar nome, cabecalho e margens da folha. Quanto mais enxuto for o recorte
@@ -726,33 +820,53 @@ export default function App() {
           </Card>
 
           <Card
-            title={captureDraft ? "Recorte do gabarito" : pendingScan ? "Conferencia das respostas" : "Fluxo da leitura"}
+            title={
+              operationFlow.phase === "crop_editing" || operationFlow.phase === "photo_loaded"
+                ? "Recorte do gabarito"
+                : operationFlow.phase === "reviewing" || operationFlow.phase === "saving"
+                  ? "Conferencia das respostas"
+                  : "Fluxo da leitura"
+            }
             description={
-              captureDraft
+              operationFlow.phase === "crop_editing" || operationFlow.phase === "photo_loaded"
                 ? "Arraste ou redimensione o retangulo para cobrir somente o bloco do gabarito."
-                : pendingScan
+                : operationFlow.phase === "reviewing" || operationFlow.phase === "saving"
                   ? "Ajuste respostas ambíguas, selecione o aluno e confirme."
                   : "Depois da foto, o sistema vai sugerir um recorte e so entao analisar o gabarito."
             }
           >
             <div ref={operationFocusRef} />
-            {captureDraft ? (
+            <div className="flow-headline">
+              <strong>{operationFlow.statusText}</strong>
+              <p>{operationFlow.detailText}</p>
+            </div>
+            {"warningText" in operationFlow && operationFlow.warningText ? (
+              <div className="warning-card">
+                <strong>Atencao</strong>
+                <p>{operationFlow.warningText}</p>
+              </div>
+            ) : null}
+            {operationFlow.phase === "crop_editing" || operationFlow.phase === "photo_loaded" ? (
               <>
                 <div className="receipt-card">
                   <strong>Foto recebida</strong>
-                  <p>{captureDraft.fileName}</p>
-                  <p>{captureDraft.fileSizeKb} KB • modelo {captureDraft.template.name}</p>
+                  <p>{operationFlow.capture.fileName}</p>
+                  <p>{operationFlow.capture.fileSizeKb} KB • modelo {operationFlow.capture.template.name}</p>
                 </div>
                 <CropEditor
-                  imageUrl={captureDraft.normalizedImage}
-                  crop={captureDraft.confirmedCrop}
-                  suggestedCrop={captureDraft.suggestedCrop}
+                  imageUrl={operationFlow.capture.normalizedImage}
+                  crop={operationFlow.capture.confirmedCrop}
+                  suggestedCrop={operationFlow.capture.suggestedCrop}
                   onChange={(nextCrop) =>
-                    setCaptureDraft((current) =>
-                      current
+                    setOperationFlow((current) =>
+                      current.phase === "crop_editing" || current.phase === "photo_loaded"
                         ? {
                             ...current,
-                            confirmedCrop: clampCrop(nextCrop)
+                            phase: "crop_editing",
+                            capture: {
+                              ...current.capture,
+                              confirmedCrop: clampCrop(nextCrop)
+                            }
                           }
                         : current
                     )
@@ -762,52 +876,61 @@ export default function App() {
                   <button
                     className="secondary"
                     onClick={() => {
-                      setCaptureDraft(null);
-                      setOperationStage("idle");
-                      setCaptureMessage("Capture novamente somente o bloco do gabarito.");
+                      setOperationFlow({
+                        phase: "idle",
+                        statusText: "Pronto para fotografar",
+                        detailText: "Capture novamente somente o bloco do gabarito."
+                      });
                     }}
                   >
                     Refazer foto
                   </button>
                   <button className="secondary" onClick={() =>
-                    setCaptureDraft((current) =>
-                      current
+                    setOperationFlow((current) =>
+                      current.phase === "crop_editing" || current.phase === "photo_loaded"
                         ? {
                             ...current,
-                            confirmedCrop: current.suggestedCrop
+                            capture: {
+                              ...current.capture,
+                              confirmedCrop: current.capture.suggestedCrop
+                            }
                           }
                         : current
                     )
                   }>
                     Voltar sugestao
                   </button>
-                  <button className="primary" onClick={() => void safely(analyzeConfirmedCrop)}>
+                  <button
+                    className="primary"
+                    disabled={analysisLockRef.current}
+                    onClick={() => void safely(analyzeConfirmedCrop)}
+                  >
                     Analisar gabarito
                   </button>
                 </div>
               </>
-            ) : pendingScan ? (
+            ) : operationFlow.phase === "reviewing" || operationFlow.phase === "saving" ? (
               <>
                 <div className="receipt-card success">
                   <strong>Leitura gerada</strong>
                   <p>O gabarito foi analisado. Agora confira e confirme o aluno.</p>
                 </div>
                 <div className="preview-grid">
-                  <img src={pendingScan.imageUrl} alt="Foto original do gabarito" />
-                  <img src={pendingScan.normalizedImage} alt="Recorte usado para leitura" />
+                  <img src={operationFlow.review.imageUrl} alt="Foto original do gabarito" />
+                  <img src={operationFlow.review.normalizedImage} alt="Recorte usado para leitura" />
                 </div>
                 <div className="scan-summary">
-                  <MetricCard label="Acertos" value={String(pendingScan.correctCount)} />
-                  <MetricCard label="Percentual" value={`${pendingScan.percent}%`} />
-                  <MetricCard label="Confianca" value={`${Math.round(pendingScan.confidence * 100)}%`} />
+                  <MetricCard label="Acertos" value={String(operationFlow.review.correctCount)} />
+                  <MetricCard label="Percentual" value={`${operationFlow.review.percent}%`} />
+                  <MetricCard label="Confianca" value={`${Math.round(operationFlow.review.confidence * 100)}%`} />
                   <MetricCard
                     label="Revisar"
-                    value={String(new Set([...pendingScan.ambiguousQuestions, ...pendingScan.blanks]).size)}
+                    value={String(new Set([...operationFlow.review.ambiguousQuestions, ...operationFlow.review.blanks]).size)}
                   />
                 </div>
                 <div className="note-block">
                   <strong>Leitura focada no bloco do gabarito</strong>
-                  <p>{pendingScan.template.name}</p>
+                  <p>{operationFlow.review.template.name}</p>
                   <p>O sistema analisou apenas o recorte confirmado da grade de respostas.</p>
                 </div>
                 <label>
@@ -830,9 +953,9 @@ export default function App() {
                   </select>
                 </label>
                 <div className="answers-grid">
-                  {pendingScan.finalAnswers.map((answer, index) => {
+                  {operationFlow.review.finalAnswers.map((answer, index) => {
                     const needsReview =
-                      pendingScan.ambiguousQuestions.includes(index) || pendingScan.blanks.includes(index);
+                      operationFlow.review.ambiguousQuestions.includes(index) || operationFlow.review.blanks.includes(index);
                     return (
                       <div key={index} className={`answer-card ${needsReview ? "warn" : ""}`}>
                         <span>Q{index + 1}</span>
@@ -843,7 +966,7 @@ export default function App() {
                           }
                         >
                           {alternativeLabels
-                            .slice(0, pendingScan.template.alternativesCount)
+                            .slice(0, operationFlow.review.template.alternativesCount)
                             .map((label) => (
                               <option key={label} value={label}>
                                 {label}
@@ -855,12 +978,21 @@ export default function App() {
                   })}
                 </div>
                 <div className="capture-toolbar">
-                  <button className="secondary" onClick={() => setPendingScan(null)}>
+                  <button
+                    className="secondary"
+                    onClick={() =>
+                      setOperationFlow({
+                        phase: "idle",
+                        statusText: "Pronto para fotografar",
+                        detailText: "Leitura descartada. Fotografe novamente o gabarito."
+                      })
+                    }
+                  >
                     Descartar leitura
                   </button>
                   <button
                     className="primary"
-                    disabled={!selectedStudentId}
+                    disabled={!selectedStudentId || operationFlow.phase === "saving"}
                     onClick={() => void safely(confirmPendingScan)}
                   >
                     Confirmar leitura
@@ -1175,8 +1307,11 @@ export default function App() {
                   onClick={() => {
                     setSelectedLotId(lot.id);
                     setSelectedStudentId("");
-                    setCaptureDraft(null);
-                    setPendingScan(null);
+                    setOperationFlow({
+                      phase: "idle",
+                      statusText: "Pronto para fotografar",
+                      detailText: "Escolha um lote e fotografe somente a area do gabarito."
+                    });
                   }}
                 >
                   <strong>{lot.name}</strong>

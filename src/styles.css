@@ -402,6 +402,42 @@ textarea {
   color: var(--muted);
 }
 
+.flow-headline {
+  margin-bottom: 0.9rem;
+  padding: 0.95rem 1rem;
+  border-radius: 1rem;
+  background: rgba(16, 51, 58, 0.05);
+  border: 1px solid var(--border);
+}
+
+.flow-headline strong {
+  display: block;
+  margin-bottom: 0.25rem;
+}
+
+.flow-headline p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.warning-card {
+  margin-bottom: 0.9rem;
+  padding: 0.95rem 1rem;
+  border-radius: 1rem;
+  background: rgba(228, 138, 61, 0.16);
+  border: 1px solid rgba(228, 138, 61, 0.3);
+}
+
+.warning-card strong {
+  display: block;
+  margin-bottom: 0.25rem;
+}
+
+.warning-card p {
+  margin: 0;
+  color: var(--primary);
+}
+
 .manual-frame {
   position: relative;
   aspect-ratio: 3 / 4;
