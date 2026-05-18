@@ -10,6 +10,7 @@ import {
   getImageData
 } from "./lib/image";
 import { normalizeCanvasWithOpenCv } from "./lib/opencv";
+import { detectBookletCodeFromCanvas } from "./lib/ocr";
 import { getScanWorker } from "./lib/scan-worker-client";
 import { useAppStore } from "./store/useAppStore";
 import type {
@@ -60,6 +61,45 @@ const defaultTemplateDraft: TemplateDraft = {
   threshold: 31,
   minConfidence: 0.11
 };
+
+const proeaTemplatePresetsSource: Array<[string, string, string, number]> = [
+  ["6º ano", "Língua Portuguesa", "P0602", 26],
+  ["6º ano", "Matemática", "M0602", 26],
+  ["6º ano", "Ciências da Natureza", "N0602", 27],
+  ["7º ano", "Língua Portuguesa", "P0702", 26],
+  ["7º ano", "Matemática", "M0702", 26],
+  ["7º ano", "Ciências da Natureza", "N0702", 27],
+  ["8º ano", "Língua Portuguesa", "P0802", 26],
+  ["8º ano", "Matemática", "M0802", 26],
+  ["8º ano", "Ciências da Natureza", "N0802", 27],
+  ["9º ano", "Língua Portuguesa", "P0902", 26],
+  ["9º ano", "Matemática", "M0902", 26],
+  ["9º ano", "Ciências da Natureza", "N0902", 27]
+];
+
+const proeaTemplatePresets: Array<
+  Omit<TemplateModel, "createdAt"> & { id: string }
+> = proeaTemplatePresetsSource.map(([gradeLabel, subjectLabel, bookletCode, questionCount]) => ({
+  id: `proea-${bookletCode.toLowerCase()}`,
+  name: `PROEA ${gradeLabel} - ${subjectLabel}`,
+  family: "PROEA Anos Finais 2026",
+  gradeLabel,
+  subjectLabel,
+  bookletCode,
+  questionCount,
+  alternativesCount: 4,
+  columnCount: questionCount === 27 ? 3 : 4,
+  rowGapRatio: 0.015,
+  columnGapRatio: 0.045,
+  region: {
+    x: 0.2,
+    y: 0.18,
+    width: 0.62,
+    height: 0.68
+  },
+  threshold: 31,
+  minConfidence: 0.11
+}));
 
 const defaultLotDraft: LotDraft = {
   name: "",
@@ -250,6 +290,17 @@ export default function App() {
     await refreshAll();
   }
 
+  async function seedProeaTemplates() {
+    const now = new Date().toISOString();
+    const rows: TemplateModel[] = proeaTemplatePresets.map((preset) => ({
+      ...preset,
+      createdAt: now
+    }));
+    await db.templates.bulkPut(rows);
+    setNotice("Modelos PROEA 6º ao 9º carregados na base local.");
+    await refreshAll();
+  }
+
   async function saveLot() {
     const template = templates.find((item) => item.id === lotDraft.templateId);
     if (!template) {
@@ -305,13 +356,31 @@ export default function App() {
   }
 
   async function analyzeImage(dataUrl: string) {
-    if (!selectedLot || !selectedTemplate) {
+    if (!selectedLot) {
       throw new Error("Escolha um lote ativo antes de capturar.");
     }
 
     setBusyMessage("Preparando imagem e aplicando normalizacao...");
     const canvas = await drawImageToCanvas(dataUrl);
-    const normalizedCanvas = await normalizeCanvasWithOpenCv(canvas, selectedTemplate);
+    let templateForAnalysis = selectedTemplate;
+
+    setBusyMessage("Identificando o codigo do caderno...");
+    const bookletDetection = await detectBookletCodeFromCanvas(canvas);
+    if (bookletDetection.code) {
+      const matchedTemplate = templates.find(
+        (template) => template.bookletCode === bookletDetection.code
+      );
+      if (matchedTemplate) {
+        templateForAnalysis = matchedTemplate;
+        setNotice(`Codigo do caderno detectado: ${bookletDetection.code}. Modelo escolhido automaticamente.`);
+      }
+    }
+
+    if (!templateForAnalysis) {
+      throw new Error("Nao foi possivel definir o modelo de leitura para este lote.");
+    }
+
+    const normalizedCanvas = await normalizeCanvasWithOpenCv(canvas, templateForAnalysis);
     const imageData = getImageData(normalizedCanvas);
     const worker = await getScanWorker();
     setBusyMessage("Lendo regioes de resposta do modelo calibrado...");
@@ -319,12 +388,13 @@ export default function App() {
       pixels: imageData.data,
       width: imageData.width,
       height: imageData.height,
-      template: selectedTemplate
+      template: templateForAnalysis
     });
     const score = scoreAnswers(analysis.detectedAnswers, selectedLot.answerKey);
     const nextPending: PendingScan = {
       lot: selectedLot,
-      template: selectedTemplate,
+      template: templateForAnalysis,
+      detectedBookletCode: bookletDetection.code ?? undefined,
       imageUrl: dataUrl,
       normalizedImage: canvasToDataUrl(normalizedCanvas),
       detectedAnswers: analysis.detectedAnswers,
@@ -624,9 +694,27 @@ export default function App() {
             </p>
           </div>
 
-          <button className="primary" onClick={() => void safely(saveTemplate)}>
-            Salvar modelo
-          </button>
+          <div className="capture-toolbar">
+            <button className="primary" onClick={() => void safely(saveTemplate)}>
+              Salvar modelo
+            </button>
+            <button className="secondary" onClick={() => void safely(seedProeaTemplates)}>
+              Carregar modelos PROEA
+            </button>
+          </div>
+
+          <div className="note-block">
+            <strong>Estrutura detectada no PDF PROEA</strong>
+            <p>
+              Os 12 gabaritos do arquivo seguem uma família visual consistente: 4 alternativas
+              (`A-D`), códigos de caderno como `P0602`, `M0702` e `N0902`, com 26 questões em
+              Língua Portuguesa e Matemática e 27 questões em Ciências da Natureza.
+            </p>
+            <p>
+              Isso permite que o app trate esses cadernos como modelos pré-calibrados, em vez de
+              começar sempre do zero.
+            </p>
+          </div>
 
           <div className="stack">
             {templates.map((template) => (
@@ -640,6 +728,11 @@ export default function App() {
                   {template.questionCount} questoes, {template.alternativesCount} alternativas,{" "}
                   {template.columnCount} colunas
                 </span>
+                {template.bookletCode ? (
+                  <span>
+                    {template.family} • {template.bookletCode}
+                  </span>
+                ) : null}
               </button>
             ))}
           </div>
@@ -682,6 +775,7 @@ export default function App() {
                 {templates.map((template) => (
                   <option key={template.id} value={template.id}>
                     {template.name}
+                    {template.bookletCode ? ` (${template.bookletCode})` : ""}
                   </option>
                 ))}
               </select>
@@ -826,6 +920,16 @@ export default function App() {
                     ]).size
                   )}
                 />
+              </div>
+
+              <div className="note-block">
+                <strong>Modelo escolhido</strong>
+                <p>
+                  {pendingScan.template.name}
+                  {pendingScan.detectedBookletCode
+                    ? ` • codigo detectado ${pendingScan.detectedBookletCode}`
+                    : " • codigo do caderno nao detectado, usando modelo atual do lote"}
+                </p>
               </div>
 
               <label>

@@ -3,6 +3,10 @@ export type AlternativeLabel = "A" | "B" | "C" | "D" | "E" | "F";
 export type TemplateModel = {
   id: string;
   name: string;
+  family?: string;
+  gradeLabel?: string;
+  subjectLabel?: string;
+  bookletCode?: string;
   questionCount: number;
   alternativesCount: number;
   columnCount: number;
@@ -60,6 +64,7 @@ export type ScanRecord = {
 export type PendingScan = {
   lot: Lot;
   template: TemplateModel;
+  detectedBookletCode?: string;
   imageUrl: string;
   normalizedImage: string;
   detectedAnswers: AlternativeLabel[];
@@ -86,3 +91,7 @@ export type ScanAnalysis = {
 
 export const alternativeLabels: AlternativeLabel[] = ["A", "B", "C", "D", "E", "F"];
 
+export type BookletDetection = {
+  code: string | null;
+  rawText: string;
+};

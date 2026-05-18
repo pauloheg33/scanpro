@@ -238,6 +238,24 @@ textarea {
   margin-bottom: 1rem;
 }
 
+.note-block {
+  margin: 0.9rem 0 1rem;
+  padding: 0.95rem 1rem;
+  border-radius: 1rem;
+  background: rgba(16, 51, 58, 0.05);
+  border: 1px solid var(--border);
+}
+
+.note-block strong {
+  display: block;
+  margin-bottom: 0.35rem;
+}
+
+.note-block p {
+  margin: 0.2rem 0;
+  color: var(--muted);
+}
+
 .phone-sheet {
   position: relative;
   aspect-ratio: 3 / 4;
