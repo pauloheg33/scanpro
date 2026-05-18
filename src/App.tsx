@@ -3,21 +3,18 @@ import { db } from "./lib/db";
 import { exportBackupJson, exportLotCsv, importBackupJson } from "./lib/export";
 import {
   canvasToDataUrl,
-  captureVideoFrame,
   createId,
-  detectInkBoundingRegion,
   cropCanvasToRegion,
+  detectInkBoundingRegion,
   drawImageToCanvas,
   fileToDataUrl,
   getImageData
 } from "./lib/image";
 import { normalizeCanvasWithOpenCv } from "./lib/opencv";
-import { detectBookletCodeFromCanvas } from "./lib/ocr";
 import { getScanWorker } from "./lib/scan-worker-client";
 import { useAppStore } from "./store/useAppStore";
 import type {
   AlternativeLabel,
-  BookletDetection,
   Lot,
   PendingScan,
   ScanRecord,
@@ -52,6 +49,26 @@ type LotDraft = {
 
 type AppView = "operacao" | "lotes" | "modelos" | "resultados";
 
+type CropRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type CaptureDraft = {
+  lot: Lot;
+  template: TemplateModel;
+  imageUrl: string;
+  normalizedImage: string;
+  suggestedCrop: CropRect;
+  confirmedCrop: CropRect;
+};
+
+type DragMode = "move" | "se" | "sw" | "ne" | "nw";
+
+const MIN_CROP_SIZE = 0.16;
+
 const defaultTemplateDraft: TemplateDraft = {
   name: "",
   questionCount: 20,
@@ -65,6 +82,15 @@ const defaultTemplateDraft: TemplateDraft = {
   columnGapRatio: 0.05,
   threshold: 31,
   minConfidence: 0.11
+};
+
+const defaultLotDraft: LotDraft = {
+  name: "",
+  className: "",
+  templateId: "",
+  expectedStudentCount: 30,
+  answerKey: "",
+  roster: ""
 };
 
 const proeaTemplatePresetsSource: Array<[string, string, string, number]> = [
@@ -98,30 +124,11 @@ const proeaTemplatePresets: Array<
   columnGapRatio: 0.045,
   region:
     questionCount === 27
-      ? {
-          x: 0.14,
-          y: 0.624,
-          width: 0.793,
-          height: 0.266
-        }
-      : {
-          x: 0.121,
-          y: 0.645,
-          width: 0.83,
-          height: 0.228
-        },
+      ? { x: 0.14, y: 0.624, width: 0.793, height: 0.266 }
+      : { x: 0.121, y: 0.645, width: 0.83, height: 0.228 },
   threshold: 31,
   minConfidence: 0.11
 }));
-
-const defaultLotDraft: LotDraft = {
-  name: "",
-  className: "",
-  templateId: "",
-  expectedStudentCount: 30,
-  answerKey: "",
-  roster: ""
-};
 
 function scoreAnswers(detectedAnswers: AlternativeLabel[], answerKey: AlternativeLabel[]) {
   let correctCount = 0;
@@ -153,6 +160,22 @@ function formatDate(value: string) {
   }).format(new Date(value));
 }
 
+function clampCrop(crop: CropRect): CropRect {
+  const width = Math.min(1, Math.max(MIN_CROP_SIZE, crop.width));
+  const height = Math.min(1, Math.max(MIN_CROP_SIZE, crop.height));
+  const x = Math.min(1 - width, Math.max(0, crop.x));
+  const y = Math.min(1 - height, Math.max(0, crop.y));
+  return { x, y, width, height };
+}
+
+function createProeaSeedRows() {
+  const createdAt = new Date().toISOString();
+  return proeaTemplatePresets.map((preset) => ({
+    ...preset,
+    createdAt
+  }));
+}
+
 export default function App() {
   const [templates, setTemplates] = useState<TemplateModel[]>([]);
   const [lots, setLots] = useState<Lot[]>([]);
@@ -164,29 +187,18 @@ export default function App() {
   const [busyMessage, setBusyMessage] = useState("");
   const [notice, setNotice] = useState("");
   const [activeView, setActiveView] = useState<AppView>("operacao");
-  const [cameraState, setCameraState] = useState<"idle" | "live" | "error">("idle");
-  const [cameraError, setCameraError] = useState("");
-  const [autoCaptureEnabled, setAutoCaptureEnabled] = useState(false);
-  const [ocrAssistEnabled, setOcrAssistEnabled] = useState(false);
-  const [guideStatus, setGuideStatus] = useState<
-    "idle" | "searching" | "aligning" | "locked" | "capturing"
-  >("idle");
-  const [guideConfidence, setGuideConfidence] = useState(0);
   const [captureMessage, setCaptureMessage] = useState(
-    "Cadastre ou escolha um lote, abra a camera e fotografe um gabarito por vez."
+    "Escolha um lote e fotografe somente a area do gabarito."
   );
   const [selectedStudentId, setSelectedStudentId] = useState("");
   const [activePreviewTemplateId, setActivePreviewTemplateId] = useState("");
+  const [captureDraft, setCaptureDraft] = useState<CaptureDraft | null>(null);
   const selectedLotId = useAppStore((state) => state.selectedLotId);
   const pendingScan = useAppStore((state) => state.pendingScan);
   const setSelectedLotId = useAppStore((state) => state.setSelectedLotId);
   const setPendingScan = useAppStore((state) => state.setPendingScan);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const autoCaptureBusyRef = useRef(false);
-  const autoCaptureFrameRef = useRef<number | null>(null);
-  const stableFrameCountRef = useRef(0);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const captureInputRef = useRef<HTMLInputElement | null>(null);
+  const galleryInputRef = useRef<HTMLInputElement | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
 
   const selectedLot = useMemo(
@@ -208,7 +220,10 @@ export default function App() {
     () => scans.filter((scan) => scan.lotId === selectedLotId),
     [scans, selectedLotId]
   );
-  const selectedStudentScanIds = useMemo(() => new Set(lotScans.map((item) => item.studentId)), [lotScans]);
+  const selectedStudentScanIds = useMemo(
+    () => new Set(lotScans.map((item) => item.studentId)),
+    [lotScans]
+  );
 
   useEffect(() => {
     async function loadAll() {
@@ -218,100 +233,33 @@ export default function App() {
         db.students.orderBy("createdAt").toArray(),
         db.scans.orderBy("createdAt").reverse().toArray()
       ]);
-      setTemplates(nextTemplates);
-      setLots(nextLots);
-      setStudents(nextStudents);
-      setScans(nextScans);
+
       if (nextTemplates.length === 0) {
-        const now = new Date().toISOString();
-        await db.templates.bulkPut(
-          proeaTemplatePresets.map((preset) => ({
-            ...preset,
-            createdAt: now
-          }))
-        );
-        const seededTemplates = await db.templates.orderBy("createdAt").reverse().toArray();
-        setTemplates(seededTemplates);
-        setNotice("Modelos PROEA carregados automaticamente para facilitar a primeira leitura.");
+        await db.templates.bulkPut(createProeaSeedRows());
       }
-      if (!selectedLotId && nextLots[0]) {
-        setSelectedLotId(nextLots[0].id);
+
+      const [finalTemplates, finalLots, finalStudents, finalScans] = await Promise.all([
+        db.templates.orderBy("createdAt").reverse().toArray(),
+        db.lots.orderBy("createdAt").reverse().toArray(),
+        db.students.orderBy("createdAt").toArray(),
+        db.scans.orderBy("createdAt").reverse().toArray()
+      ]);
+
+      setTemplates(finalTemplates);
+      setLots(finalLots);
+      setStudents(finalStudents);
+      setScans(finalScans);
+      if (!selectedLotId && finalLots[0]) {
+        setSelectedLotId(finalLots[0].id);
+      }
+      if (nextTemplates.length === 0) {
+        setNotice("Modelos PROEA carregados automaticamente para a operacao.");
       }
       setLoading(false);
     }
+
     void loadAll();
   }, [selectedLotId, setSelectedLotId]);
-
-  useEffect(() => {
-    return () => {
-      void stopCamera();
-    };
-  }, []);
-
-  useEffect(() => {
-    if (cameraState !== "live" || !autoCaptureEnabled || pendingScan) {
-      if (autoCaptureFrameRef.current) {
-        cancelAnimationFrame(autoCaptureFrameRef.current);
-        autoCaptureFrameRef.current = null;
-      }
-      stableFrameCountRef.current = 0;
-      if (cameraState !== "live") {
-        setGuideStatus("idle");
-        setGuideConfidence(0);
-      }
-      return;
-    }
-
-    const loop = () => {
-      const video = videoRef.current;
-      if (!video || video.readyState < 2 || autoCaptureBusyRef.current) {
-        autoCaptureFrameRef.current = requestAnimationFrame(loop);
-        return;
-      }
-
-      const guide = evaluateGuide(video);
-      setGuideConfidence(guide.score);
-
-      if (guide.score > 0.86) {
-        stableFrameCountRef.current += 1;
-        setGuideStatus(stableFrameCountRef.current >= 6 ? "locked" : "aligning");
-      } else if (guide.score > 0.62) {
-        stableFrameCountRef.current = Math.max(0, stableFrameCountRef.current - 1);
-        setGuideStatus("aligning");
-      } else {
-        stableFrameCountRef.current = 0;
-        setGuideStatus("searching");
-      }
-
-      if (stableFrameCountRef.current >= 6) {
-        autoCaptureBusyRef.current = true;
-        setGuideStatus("capturing");
-        setCaptureMessage("Folha alinhada. Disparando a captura automaticamente...");
-        void safely(async () => {
-          await handleCaptureFromCamera();
-        }).finally(() => {
-          stableFrameCountRef.current = 0;
-          autoCaptureBusyRef.current = false;
-          if (cameraState === "live" && autoCaptureEnabled && !pendingScan) {
-            autoCaptureFrameRef.current = requestAnimationFrame(loop);
-          }
-        });
-        return;
-      }
-
-      autoCaptureFrameRef.current = requestAnimationFrame(loop);
-    };
-
-    setGuideStatus("searching");
-    autoCaptureFrameRef.current = requestAnimationFrame(loop);
-
-    return () => {
-      if (autoCaptureFrameRef.current) {
-        cancelAnimationFrame(autoCaptureFrameRef.current);
-        autoCaptureFrameRef.current = null;
-      }
-    };
-  }, [autoCaptureEnabled, cameraState, pendingScan]);
 
   async function refreshAll() {
     const [nextTemplates, nextLots, nextStudents, nextScans] = await Promise.all([
@@ -324,49 +272,6 @@ export default function App() {
     setLots(nextLots);
     setStudents(nextStudents);
     setScans(nextScans);
-  }
-
-  async function stopCamera() {
-    if (streamRef.current) {
-      for (const track of streamRef.current.getTracks()) {
-        track.stop();
-      }
-      streamRef.current = null;
-    }
-    setCameraState("idle");
-    setGuideStatus("idle");
-    setGuideConfidence(0);
-  }
-
-  async function startCamera() {
-    setCameraError("");
-    setCaptureMessage("Solicitando acesso a camera traseira do iPhone...");
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: { ideal: "environment" },
-          width: { ideal: 1920 },
-          height: { ideal: 1080 }
-        },
-        audio: false
-      });
-      streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
-      }
-      setCameraState("live");
-      setCaptureMessage(
-        autoCaptureEnabled
-          ? "Camera pronta. Alinhe a folha na grade; o app dispara sozinho quando travar."
-          : "Camera pronta. Alinhe a folha na grade e use o botao Capturar para evitar travamentos."
-      );
-    } catch (error) {
-      setCameraState("error");
-      setCameraError("Nao foi possivel abrir a camera. Use a galeria como plano B.");
-      setCaptureMessage("Camera indisponivel. Tente enviar uma foto existente.");
-      console.error(error);
-    }
   }
 
   async function saveTemplate() {
@@ -397,12 +302,7 @@ export default function App() {
   }
 
   async function seedProeaTemplates() {
-    const now = new Date().toISOString();
-    const rows: TemplateModel[] = proeaTemplatePresets.map((preset) => ({
-      ...preset,
-      createdAt: now
-    }));
-    await db.templates.bulkPut(rows);
+    await db.templates.bulkPut(createProeaSeedRows());
     setNotice("Modelos PROEA 6º ao 9º carregados na base local.");
     await refreshAll();
   }
@@ -420,6 +320,7 @@ export default function App() {
     if (answerKey.length !== template.questionCount) {
       throw new Error("O gabarito precisa ter exatamente uma letra por questao.");
     }
+
     const lotId = createId("lot");
     const createdAt = new Date().toISOString();
     const lot: Lot = {
@@ -443,6 +344,7 @@ export default function App() {
       roster.length > 0
         ? roster
         : Array.from({ length: lotDraft.expectedStudentCount }, (_, index) => `Aluno ${index + 1}`);
+
     const studentRows: Student[] = studentsToCreate.map((name) => ({
       id: createId("std"),
       lotId,
@@ -457,134 +359,94 @@ export default function App() {
 
     setLotDraft(defaultLotDraft);
     setSelectedLotId(lotId);
-    setNotice("Lote criado e pronto para receber leituras.");
+    setNotice("Lote criado e pronto para leitura manual do gabarito.");
     await refreshAll();
   }
 
-  async function analyzeImage(dataUrl: string) {
-    if (!selectedLot) {
-      throw new Error("Escolha um lote ativo antes de capturar.");
+  async function prepareCapture(file: File) {
+    if (!selectedLot || !selectedTemplate) {
+      throw new Error("Escolha um lote com modelo definido antes de fotografar.");
     }
-    if (autoCaptureBusyRef.current) {
-      return;
-    }
-    autoCaptureBusyRef.current = true;
 
-    try {
-      setBusyMessage("Preparando imagem e aplicando normalizacao...");
-      const canvas = await drawImageToCanvas(dataUrl);
-      let templateForAnalysis = selectedTemplate;
-      let nextNotice = "";
+    setBusyMessage("Preparando a foto do gabarito...");
+    const imageUrl = await fileToDataUrl(file);
+    const originalCanvas = await drawImageToCanvas(imageUrl);
+    const normalizedCanvas = await normalizeCanvasWithOpenCv(originalCanvas, selectedTemplate);
+    const suggestedCrop = clampCrop(
+      detectInkBoundingRegion(normalizedCanvas, selectedTemplate.region, {
+        expandX: 0.035,
+        expandY: 0.04,
+        minRowInk: 0.05,
+        minColInk: 0.05,
+        minWidthRatio: 0.58,
+        minHeightRatio: 0.58,
+        padX: 0.01,
+        padY: 0.01
+      })
+    );
 
-      let bookletDetection: BookletDetection = { code: null, rawText: "" };
-      const lotTemplate = templates.find((template) => template.id === selectedLot.templateId) ?? null;
-      const shouldRunOcr =
-        ocrAssistEnabled && !pendingScan && (!lotTemplate?.bookletCode || lotTemplate.family === "PROEA Anos Finais 2026");
-
-      if (shouldRunOcr) {
-        setBusyMessage("Identificando o codigo do caderno...");
-        bookletDetection = await detectBookletCodeFromCanvas(canvas);
-      }
-
-      if (bookletDetection.code && selectedLot.templateId) {
-        const matchedTemplate = templates.find((template) => template.bookletCode === bookletDetection.code);
-        if (matchedTemplate && lotTemplate?.bookletCode === bookletDetection.code) {
-          templateForAnalysis = matchedTemplate;
-          nextNotice = `Codigo do caderno detectado: ${bookletDetection.code}. Modelo confirmado automaticamente.`;
-        } else if (matchedTemplate && lotTemplate?.bookletCode && lotTemplate.bookletCode !== bookletDetection.code) {
-          nextNotice = `Codigo detectado ${bookletDetection.code}, mas o lote ativo espera ${lotTemplate.bookletCode}. Mantendo o modelo do lote para evitar correcao errada.`;
-        } else if (matchedTemplate && !lotTemplate?.bookletCode) {
-          templateForAnalysis = matchedTemplate;
-          nextNotice = `Codigo do caderno detectado: ${bookletDetection.code}. Modelo escolhido automaticamente.`;
-        }
-      }
-
-      if (!templateForAnalysis) {
-        throw new Error("Nao foi possivel definir o modelo de leitura para este lote.");
-      }
-
-      const normalizedCanvas = await normalizeCanvasWithOpenCv(canvas, templateForAnalysis);
-      setBusyMessage("Detectando o retangulo exato do campo do gabarito...");
-      const detectedAnswerRegion = detectInkBoundingRegion(
-        normalizedCanvas,
-        templateForAnalysis.region,
-        templateForAnalysis.questionCount === 27
-          ? {
-              expandX: 0.035,
-              expandY: 0.045,
-              minRowInk: 0.055,
-              minColInk: 0.05,
-              minWidthRatio: 0.62,
-              minHeightRatio: 0.7,
-              padX: 0.008,
-              padY: 0.01
-            }
-          : {
-              expandX: 0.04,
-              expandY: 0.04,
-              minRowInk: 0.055,
-              minColInk: 0.05,
-              minWidthRatio: 0.72,
-              minHeightRatio: 0.62,
-              padX: 0.008,
-              padY: 0.01
-            }
-      );
-      setBusyMessage("Recortando apenas o campo detectado do gabarito...");
-      const answerRegionCanvas = cropCanvasToRegion(normalizedCanvas, detectedAnswerRegion);
-      const imageData = getImageData(answerRegionCanvas);
-      const worker = await getScanWorker();
-      setBusyMessage("Lendo regioes de resposta do modelo calibrado...");
-      const analysis = await worker.analyze({
-        pixels: imageData.data,
-        width: imageData.width,
-        height: imageData.height,
-        template: {
-          ...templateForAnalysis,
-          region: {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1
-          }
-        }
-      });
-      const score = scoreAnswers(analysis.detectedAnswers, selectedLot.answerKey);
-      const nextPending: PendingScan = {
-        lot: selectedLot,
-        template: templateForAnalysis,
-        detectedBookletCode: bookletDetection.code ?? undefined,
-        imageUrl: dataUrl,
-        normalizedImage: canvasToDataUrl(answerRegionCanvas),
-        detectedAnswers: analysis.detectedAnswers,
-        finalAnswers: [...analysis.detectedAnswers],
-        ambiguousQuestions: analysis.ambiguousQuestions,
-        blanks: analysis.blanks,
-        correctCount: score.correctCount,
-        percent: score.percent,
-        confidence: analysis.confidence
-      };
-      setPendingScan(nextPending);
-      setBusyMessage("");
-      setNotice(nextNotice);
-      setGuideStatus("idle");
-      setCaptureMessage("Leitura pronta. Revise e confirme o aluno.");
-    } finally {
-      autoCaptureBusyRef.current = false;
-    }
+    setCaptureDraft({
+      lot: selectedLot,
+      template: selectedTemplate,
+      imageUrl,
+      normalizedImage: canvasToDataUrl(normalizedCanvas),
+      suggestedCrop,
+      confirmedCrop: suggestedCrop
+    });
+    setBusyMessage("");
+    setCaptureMessage("Ajuste o recorte para conter apenas o bloco do gabarito e confirme a analise.");
+    setPendingScan(null);
+    setSelectedStudentId("");
   }
 
-  async function handleCaptureFromCamera() {
-    if (!videoRef.current || cameraState !== "live") {
+  async function analyzeConfirmedCrop() {
+    if (!captureDraft) {
       return;
     }
-    const frame = captureVideoFrame(videoRef.current);
-    await analyzeImage(canvasToDataUrl(frame));
-  }
 
-  async function handleImageFile(file: File) {
-    const dataUrl = await fileToDataUrl(file);
-    await analyzeImage(dataUrl);
+    setBusyMessage("Recortando o bloco confirmado do gabarito...");
+    const normalizedCanvas = await drawImageToCanvas(captureDraft.normalizedImage);
+    const finalCrop = clampCrop(captureDraft.confirmedCrop);
+    const answerRegionCanvas = cropCanvasToRegion(normalizedCanvas, finalCrop);
+    const imageData = getImageData(answerRegionCanvas);
+    const worker = await getScanWorker();
+    setBusyMessage("Lendo as respostas marcadas...");
+    const analysis = await worker.analyze({
+      pixels: imageData.data,
+      width: imageData.width,
+      height: imageData.height,
+      template: {
+        ...captureDraft.template,
+        region: {
+          x: 0,
+          y: 0,
+          width: 1,
+          height: 1
+        }
+      }
+    });
+
+    const score = scoreAnswers(analysis.detectedAnswers, captureDraft.lot.answerKey);
+    const nextPending: PendingScan = {
+      lot: captureDraft.lot,
+      template: captureDraft.template,
+      imageUrl: captureDraft.imageUrl,
+      normalizedImage: canvasToDataUrl(answerRegionCanvas),
+      suggestedCrop: captureDraft.suggestedCrop,
+      confirmedCrop: finalCrop,
+      detectedAnswers: analysis.detectedAnswers,
+      finalAnswers: [...analysis.detectedAnswers],
+      ambiguousQuestions: analysis.ambiguousQuestions,
+      blanks: analysis.blanks,
+      correctCount: score.correctCount,
+      percent: score.percent,
+      confidence: analysis.confidence
+    };
+
+    setPendingScan(nextPending);
+    setCaptureDraft(null);
+    setBusyMessage("");
+    setCaptureMessage("Leitura pronta. Confira as respostas e confirme o aluno.");
   }
 
   async function confirmPendingScan() {
@@ -615,7 +477,7 @@ export default function App() {
     setPendingScan(null);
     setSelectedStudentId("");
     setNotice("Leitura confirmada e salva na base local.");
-    setCaptureMessage("Leitura salva. Aponte a proxima folha para nova captura automatica.");
+    setCaptureMessage("Leitura salva. Fotografe o proximo gabarito.");
     await refreshAll();
   }
 
@@ -636,7 +498,21 @@ export default function App() {
 
   async function onImportBackup(file: File) {
     setBusyMessage("Importando backup local...");
-    await importBackupJson(file);
+    const text = await file.text();
+    const payload = JSON.parse(text) as {
+      templates: TemplateModel[];
+      lots: Lot[];
+      students: Student[];
+      scans: ScanRecord[];
+    };
+
+    await db.transaction("rw", db.templates, db.lots, db.students, db.scans, async () => {
+      await db.templates.bulkPut(payload.templates);
+      await db.lots.bulkPut(payload.lots);
+      await db.students.bulkPut(payload.students);
+      await db.scans.bulkPut(payload.scans);
+    });
+
     setBusyMessage("");
     setNotice("Backup importado com sucesso.");
     await refreshAll();
@@ -654,7 +530,6 @@ export default function App() {
   }
 
   const overview = useMemo(() => {
-    const confirmed = scans.filter((scan) => scan.status === "confirmed").length;
     const average =
       scans.length === 0
         ? 0
@@ -663,13 +538,22 @@ export default function App() {
       templates: templates.length,
       lots: lots.length,
       scans: scans.length,
-      confirmed,
       average
     };
   }, [lots.length, scans, templates.length]);
 
   if (loading) {
-    return <main className="shell"><section className="hero"><h1>SCANPRO</h1><p>Carregando base local...</p></section></main>;
+    return (
+      <main className="shell">
+        <section className="app-topbar">
+          <div className="brand-block">
+            <p className="eyebrow">iPhone-first OMR</p>
+            <h1>SCANPRO</h1>
+            <p>Carregando base local...</p>
+          </div>
+        </section>
+      </main>
+    );
   }
 
   return (
@@ -679,7 +563,7 @@ export default function App() {
           <p className="eyebrow">iPhone-first OMR</p>
           <h1>SCANPRO</h1>
           <p className="hero-copy">
-            Operacao mobile para leitura de gabaritos PROEA com enquadramento guiado, disparo automatico e revisao humana.
+            Fotografe apenas a area do gabarito, ajuste o recorte e deixe o app ler a grade PROEA.
           </p>
         </div>
         <div className="hero-stats compact">
@@ -719,213 +603,431 @@ export default function App() {
 
       {notice ? <div className="notice">{notice}</div> : null}
 
+      {activeView === "operacao" ? (
+        <section className="grid two operation-grid">
+          <Card
+            title="Fotografar gabarito"
+            description="Use a camera nativa do iPhone ou a galeria. A foto deve mostrar somente a area do gabarito."
+          >
+            <div className="operation-banner three">
+              <div>
+                <strong>Lote ativo</strong>
+                <p>{selectedLot ? `${selectedLot.name} • ${selectedLot.className}` : "Nenhum lote selecionado"}</p>
+              </div>
+              <div>
+                <strong>Modelo do lote</strong>
+                <p>{selectedTemplate ? selectedTemplate.name : "Escolha um modelo no lote"}</p>
+              </div>
+              <div>
+                <strong>Guia operacional</strong>
+                <p>Capture apenas o bloco com as alternativas marcadas.</p>
+              </div>
+            </div>
+
+            <div className="capture-toolbar">
+              <button
+                className="primary"
+                disabled={!selectedLot || !selectedTemplate || Boolean(captureDraft)}
+                onClick={() => captureInputRef.current?.click()}
+              >
+                Fotografar gabarito
+              </button>
+              <button
+                className="secondary"
+                disabled={!selectedLot || !selectedTemplate || Boolean(captureDraft)}
+                onClick={() => galleryInputRef.current?.click()}
+              >
+                Escolher da galeria
+              </button>
+              <input
+                ref={captureInputRef}
+                hidden
+                type="file"
+                accept="image/*"
+                capture="environment"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) {
+                    void safely(() => prepareCapture(file));
+                  }
+                  event.target.value = "";
+                }}
+              />
+              <input
+                ref={galleryInputRef}
+                hidden
+                type="file"
+                accept="image/*"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) {
+                    void safely(() => prepareCapture(file));
+                  }
+                  event.target.value = "";
+                }}
+              />
+            </div>
+
+            <div className="capture-manual">
+              <div className="manual-frame">
+                <div className="manual-answer-block">
+                  <span>A</span>
+                  <span>B</span>
+                  <span>C</span>
+                  <span>D</span>
+                </div>
+              </div>
+              <div>
+                <strong>Como fotografar</strong>
+                <p>{captureMessage}</p>
+                {busyMessage ? <p className="hint">{busyMessage}</p> : null}
+                <p className="hint">
+                  Evite fotografar nome, cabecalho e margens da folha. Quanto mais enxuto for o recorte
+                  da foto, melhor a leitura da grade.
+                </p>
+              </div>
+            </div>
+          </Card>
+
+          <Card
+            title={captureDraft ? "Recorte do gabarito" : pendingScan ? "Conferencia das respostas" : "Fluxo da leitura"}
+            description={
+              captureDraft
+                ? "Arraste ou redimensione o retangulo para cobrir somente o bloco do gabarito."
+                : pendingScan
+                  ? "Ajuste respostas ambíguas, selecione o aluno e confirme."
+                  : "Depois da foto, o sistema vai sugerir um recorte e so entao analisar o gabarito."
+            }
+          >
+            {captureDraft ? (
+              <>
+                <CropEditor
+                  imageUrl={captureDraft.normalizedImage}
+                  crop={captureDraft.confirmedCrop}
+                  suggestedCrop={captureDraft.suggestedCrop}
+                  onChange={(nextCrop) =>
+                    setCaptureDraft((current) =>
+                      current
+                        ? {
+                            ...current,
+                            confirmedCrop: clampCrop(nextCrop)
+                          }
+                        : current
+                    )
+                  }
+                />
+                <div className="capture-toolbar">
+                  <button
+                    className="secondary"
+                    onClick={() => {
+                      setCaptureDraft(null);
+                      setCaptureMessage("Capture novamente somente o bloco do gabarito.");
+                    }}
+                  >
+                    Refazer foto
+                  </button>
+                  <button className="secondary" onClick={() =>
+                    setCaptureDraft((current) =>
+                      current
+                        ? {
+                            ...current,
+                            confirmedCrop: current.suggestedCrop
+                          }
+                        : current
+                    )
+                  }>
+                    Voltar sugestao
+                  </button>
+                  <button className="primary" onClick={() => void safely(analyzeConfirmedCrop)}>
+                    Analisar gabarito
+                  </button>
+                </div>
+              </>
+            ) : pendingScan ? (
+              <>
+                <div className="preview-grid">
+                  <img src={pendingScan.imageUrl} alt="Foto original do gabarito" />
+                  <img src={pendingScan.normalizedImage} alt="Recorte usado para leitura" />
+                </div>
+                <div className="scan-summary">
+                  <MetricCard label="Acertos" value={String(pendingScan.correctCount)} />
+                  <MetricCard label="Percentual" value={`${pendingScan.percent}%`} />
+                  <MetricCard label="Confianca" value={`${Math.round(pendingScan.confidence * 100)}%`} />
+                  <MetricCard
+                    label="Revisar"
+                    value={String(new Set([...pendingScan.ambiguousQuestions, ...pendingScan.blanks]).size)}
+                  />
+                </div>
+                <div className="note-block">
+                  <strong>Leitura focada no bloco do gabarito</strong>
+                  <p>{pendingScan.template.name}</p>
+                  <p>O sistema analisou apenas o recorte confirmado da grade de respostas.</p>
+                </div>
+                <label>
+                  Aluno do lote
+                  <select
+                    value={selectedStudentId}
+                    onChange={(event) => setSelectedStudentId(event.target.value)}
+                  >
+                    <option value="">Selecione o aluno</option>
+                    {lotStudents.map((student) => (
+                      <option
+                        key={student.id}
+                        value={student.id}
+                        disabled={selectedStudentScanIds.has(student.id)}
+                      >
+                        {student.name}
+                        {selectedStudentScanIds.has(student.id) ? " (ja lido)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <div className="answers-grid">
+                  {pendingScan.finalAnswers.map((answer, index) => {
+                    const needsReview =
+                      pendingScan.ambiguousQuestions.includes(index) || pendingScan.blanks.includes(index);
+                    return (
+                      <div key={index} className={`answer-card ${needsReview ? "warn" : ""}`}>
+                        <span>Q{index + 1}</span>
+                        <select
+                          value={answer}
+                          onChange={(event) =>
+                            updatePendingAnswer(index, event.target.value as AlternativeLabel)
+                          }
+                        >
+                          {alternativeLabels
+                            .slice(0, pendingScan.template.alternativesCount)
+                            .map((label) => (
+                              <option key={label} value={label}>
+                                {label}
+                              </option>
+                            ))}
+                        </select>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="capture-toolbar">
+                  <button className="secondary" onClick={() => setPendingScan(null)}>
+                    Descartar leitura
+                  </button>
+                  <button
+                    className="primary"
+                    disabled={!selectedStudentId}
+                    onClick={() => void safely(confirmPendingScan)}
+                  >
+                    Confirmar leitura
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div className="empty-state">
+                <p>1. Escolha um lote com modelo PROEA.</p>
+                <p>2. Fotografe apenas o campo do gabarito.</p>
+                <p>3. Ajuste o recorte tocando na imagem.</p>
+                <p>4. Analise e confirme o aluno.</p>
+              </div>
+            )}
+          </Card>
+        </section>
+      ) : null}
+
       {activeView === "modelos" ? (
         <section className="grid single">
           <Card
             title="Modelos calibrados"
-            description="Cadastre a geometria base dos gabaritos existentes. Ajuste a regiao onde ficam as bolhas e a quantidade de colunas."
+            description="Cadastre a geometria base dos gabaritos existentes. Os presets PROEA ja vem prontos."
           >
-          <div className="form-grid">
-            <label>
-              Nome do modelo
-              <input
-                value={templateDraft.name}
-                onChange={(event) =>
-                  setTemplateDraft((current) => ({ ...current, name: event.target.value }))
-                }
-                placeholder="Ex.: SAEB 5o ano"
-              />
-            </label>
-            <label>
-              Questoes
-              <input
-                type="number"
-                min={1}
-                max={120}
-                value={templateDraft.questionCount}
-                onChange={(event) =>
-                  setTemplateDraft((current) => ({
-                    ...current,
-                    questionCount: Number(event.target.value)
-                  }))
-                }
-              />
-            </label>
-            <label>
-              Alternativas
-              <input
-                type="number"
-                min={2}
-                max={6}
-                value={templateDraft.alternativesCount}
-                onChange={(event) =>
-                  setTemplateDraft((current) => ({
-                    ...current,
-                    alternativesCount: Number(event.target.value)
-                  }))
-                }
-              />
-            </label>
-            <label>
-              Colunas de questoes
-              <input
-                type="number"
-                min={1}
-                max={6}
-                value={templateDraft.columnCount}
-                onChange={(event) =>
-                  setTemplateDraft((current) => ({
-                    ...current,
-                    columnCount: Number(event.target.value)
-                  }))
-                }
-              />
-            </label>
-          </div>
+            <div className="form-grid">
+              <label>
+                Nome do modelo
+                <input
+                  value={templateDraft.name}
+                  onChange={(event) =>
+                    setTemplateDraft((current) => ({ ...current, name: event.target.value }))
+                  }
+                  placeholder="Ex.: SAEB 5o ano"
+                />
+              </label>
+              <label>
+                Questoes
+                <input
+                  type="number"
+                  min={1}
+                  max={120}
+                  value={templateDraft.questionCount}
+                  onChange={(event) =>
+                    setTemplateDraft((current) => ({
+                      ...current,
+                      questionCount: Number(event.target.value)
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                Alternativas
+                <input
+                  type="number"
+                  min={2}
+                  max={6}
+                  value={templateDraft.alternativesCount}
+                  onChange={(event) =>
+                    setTemplateDraft((current) => ({
+                      ...current,
+                      alternativesCount: Number(event.target.value)
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                Colunas de questoes
+                <input
+                  type="number"
+                  min={1}
+                  max={6}
+                  value={templateDraft.columnCount}
+                  onChange={(event) =>
+                    setTemplateDraft((current) => ({
+                      ...current,
+                      columnCount: Number(event.target.value)
+                    }))
+                  }
+                />
+              </label>
+            </div>
 
-          <div className="slider-grid">
-            <SliderField
-              label="Inicio X da regiao"
-              value={templateDraft.regionX}
-              min={0}
-              max={0.9}
-              step={0.01}
-              onChange={(value) =>
-                setTemplateDraft((current) => ({ ...current, regionX: Number(value) }))
-              }
-            />
-            <SliderField
-              label="Inicio Y da regiao"
-              value={templateDraft.regionY}
-              min={0}
-              max={0.9}
-              step={0.01}
-              onChange={(value) =>
-                setTemplateDraft((current) => ({ ...current, regionY: Number(value) }))
-              }
-            />
-            <SliderField
-              label="Largura da regiao"
-              value={templateDraft.regionWidth}
-              min={0.1}
-              max={1}
-              step={0.01}
-              onChange={(value) =>
-                setTemplateDraft((current) => ({ ...current, regionWidth: Number(value) }))
-              }
-            />
-            <SliderField
-              label="Altura da regiao"
-              value={templateDraft.regionHeight}
-              min={0.1}
-              max={1}
-              step={0.01}
-              onChange={(value) =>
-                setTemplateDraft((current) => ({ ...current, regionHeight: Number(value) }))
-              }
-            />
-            <SliderField
-              label="Espaco entre linhas"
-              value={templateDraft.rowGapRatio}
-              min={0}
-              max={0.08}
-              step={0.001}
-              onChange={(value) =>
-                setTemplateDraft((current) => ({ ...current, rowGapRatio: Number(value) }))
-              }
-            />
-            <SliderField
-              label="Espaco entre colunas"
-              value={templateDraft.columnGapRatio}
-              min={0}
-              max={0.12}
-              step={0.001}
-              onChange={(value) =>
-                setTemplateDraft((current) => ({ ...current, columnGapRatio: Number(value) }))
-              }
-            />
-            <SliderField
-              label="Limiar OpenCV"
-              value={templateDraft.threshold}
-              min={11}
-              max={63}
-              step={2}
-              onChange={(value) =>
-                setTemplateDraft((current) => ({ ...current, threshold: Number(value) }))
-              }
-            />
-            <SliderField
-              label="Confianca minima"
-              value={templateDraft.minConfidence}
-              min={0.05}
-              max={0.4}
-              step={0.01}
-              onChange={(value) =>
-                setTemplateDraft((current) => ({ ...current, minConfidence: Number(value) }))
-              }
-            />
-          </div>
-
-          <div className="template-preview">
-            <div className="phone-sheet">
-              <div
-                className="overlay-region"
-                style={{
-                  left: `${templateDraft.regionX * 100}%`,
-                  top: `${templateDraft.regionY * 100}%`,
-                  width: `${templateDraft.regionWidth * 100}%`,
-                  height: `${templateDraft.regionHeight * 100}%`
-                }}
+            <div className="slider-grid">
+              <SliderField
+                label="Inicio X da regiao"
+                value={templateDraft.regionX}
+                min={0}
+                max={0.9}
+                step={0.01}
+                onChange={(value) =>
+                  setTemplateDraft((current) => ({ ...current, regionX: Number(value) }))
+                }
+              />
+              <SliderField
+                label="Inicio Y da regiao"
+                value={templateDraft.regionY}
+                min={0}
+                max={0.9}
+                step={0.01}
+                onChange={(value) =>
+                  setTemplateDraft((current) => ({ ...current, regionY: Number(value) }))
+                }
+              />
+              <SliderField
+                label="Largura da regiao"
+                value={templateDraft.regionWidth}
+                min={0.1}
+                max={1}
+                step={0.01}
+                onChange={(value) =>
+                  setTemplateDraft((current) => ({ ...current, regionWidth: Number(value) }))
+                }
+              />
+              <SliderField
+                label="Altura da regiao"
+                value={templateDraft.regionHeight}
+                min={0.1}
+                max={1}
+                step={0.01}
+                onChange={(value) =>
+                  setTemplateDraft((current) => ({ ...current, regionHeight: Number(value) }))
+                }
+              />
+              <SliderField
+                label="Espaco entre linhas"
+                value={templateDraft.rowGapRatio}
+                min={0}
+                max={0.08}
+                step={0.001}
+                onChange={(value) =>
+                  setTemplateDraft((current) => ({ ...current, rowGapRatio: Number(value) }))
+                }
+              />
+              <SliderField
+                label="Espaco entre colunas"
+                value={templateDraft.columnGapRatio}
+                min={0}
+                max={0.12}
+                step={0.001}
+                onChange={(value) =>
+                  setTemplateDraft((current) => ({ ...current, columnGapRatio: Number(value) }))
+                }
+              />
+              <SliderField
+                label="Limiar OpenCV"
+                value={templateDraft.threshold}
+                min={11}
+                max={63}
+                step={2}
+                onChange={(value) =>
+                  setTemplateDraft((current) => ({ ...current, threshold: Number(value) }))
+                }
+              />
+              <SliderField
+                label="Confianca minima"
+                value={templateDraft.minConfidence}
+                min={0.05}
+                max={0.4}
+                step={0.01}
+                onChange={(value) =>
+                  setTemplateDraft((current) => ({ ...current, minConfidence: Number(value) }))
+                }
               />
             </div>
-            <p className="hint">
-              A area destacada representa onde o sistema espera encontrar as bolhas na foto
-              corrigida.
-            </p>
-          </div>
 
-          <div className="capture-toolbar">
-            <button className="primary" onClick={() => void safely(saveTemplate)}>
-              Salvar modelo
-            </button>
-            <button className="secondary" onClick={() => void safely(seedProeaTemplates)}>
-              Carregar modelos PROEA
-            </button>
-          </div>
+            <div className="template-preview">
+              <div className="phone-sheet">
+                <div
+                  className="overlay-region"
+                  style={{
+                    left: `${templateDraft.regionX * 100}%`,
+                    top: `${templateDraft.regionY * 100}%`,
+                    width: `${templateDraft.regionWidth * 100}%`,
+                    height: `${templateDraft.regionHeight * 100}%`
+                  }}
+                />
+              </div>
+            </div>
 
-          <div className="note-block">
-            <strong>Estrutura detectada no PDF PROEA</strong>
-            <p>
-              Os 12 gabaritos do arquivo seguem uma família visual consistente: 4 alternativas
-              (`A-D`), códigos de caderno como `P0602`, `M0702` e `N0902`, com 26 questões em
-              Língua Portuguesa e Matemática e 27 questões em Ciências da Natureza.
-            </p>
-            <p>
-              Isso permite que o app trate esses cadernos como modelos pré-calibrados, em vez de
-              começar sempre do zero.
-            </p>
-          </div>
-
-          <div className="stack">
-            {templates.map((template) => (
-              <button
-                key={template.id}
-                className={`list-button ${activePreviewTemplateId === template.id ? "selected" : ""}`}
-                onClick={() => setActivePreviewTemplateId(template.id)}
-              >
-                <strong>{template.name}</strong>
-                <span>
-                  {template.questionCount} questoes, {template.alternativesCount} alternativas,{" "}
-                  {template.columnCount} colunas
-                </span>
-                {template.bookletCode ? (
-                  <span>
-                    {template.family} • {template.bookletCode}
-                  </span>
-                ) : null}
+            <div className="capture-toolbar">
+              <button className="primary" onClick={() => void safely(saveTemplate)}>
+                Salvar modelo
               </button>
-            ))}
-          </div>
+              <button className="secondary" onClick={() => void safely(seedProeaTemplates)}>
+                Recarregar modelos PROEA
+              </button>
+            </div>
+
+            <div className="note-block">
+              <strong>Estrutura detectada no PDF PROEA</strong>
+              <p>4 alternativas (`A-D`), 26 questões em Português/Matemática e 27 em Ciências.</p>
+              <p>Esses modelos sao o ponto de partida da captura manual do bloco do gabarito.</p>
+            </div>
+
+            <div className="stack">
+              {templates.map((template) => (
+                <button
+                  key={template.id}
+                  className={`list-button ${activePreviewTemplateId === template.id ? "selected" : ""}`}
+                  onClick={() => setActivePreviewTemplateId(template.id)}
+                >
+                  <strong>{template.name}</strong>
+                  <span>
+                    {template.questionCount} questoes, {template.alternativesCount} alternativas,{" "}
+                    {template.columnCount} colunas
+                  </span>
+                  {template.bookletCode ? (
+                    <span>
+                      {template.family} • {template.bookletCode}
+                    </span>
+                  ) : null}
+                </button>
+              ))}
+            </div>
           </Card>
         </section>
       ) : null}
@@ -934,311 +1036,109 @@ export default function App() {
         <section className="grid single">
           <Card
             title="Lotes e gabaritos"
-            description="Crie a turma, informe o gabarito oficial e monte a lista de alunos que receberao as leituras."
+            description="Crie a turma, informe o gabarito oficial e selecione o modelo PROEA antes da operacao."
           >
-          <div className="form-grid">
-            <label>
-              Nome do lote
-              <input
-                value={lotDraft.name}
-                onChange={(event) =>
-                  setLotDraft((current) => ({ ...current, name: event.target.value }))
-                }
-                placeholder="Ex.: 5A Matematica - Maio"
-              />
-            </label>
-            <label>
-              Turma
-              <input
-                value={lotDraft.className}
-                onChange={(event) =>
-                  setLotDraft((current) => ({ ...current, className: event.target.value }))
-                }
-                placeholder="Ex.: 5A"
-              />
-            </label>
-            <label>
-              Modelo
-              <select
-                value={lotDraft.templateId}
-                onChange={(event) =>
-                  setLotDraft((current) => ({ ...current, templateId: event.target.value }))
-                }
-              >
-                <option value="">Escolha um modelo</option>
-                {templates.map((template) => (
-                  <option key={template.id} value={template.id}>
-                    {template.name}
-                    {template.bookletCode ? ` (${template.bookletCode})` : ""}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Quantidade esperada de alunos
-              <input
-                type="number"
-                min={1}
-                max={500}
-                value={lotDraft.expectedStudentCount}
-                onChange={(event) =>
-                  setLotDraft((current) => ({
-                    ...current,
-                    expectedStudentCount: Number(event.target.value)
-                  }))
-                }
-              />
-            </label>
-          </div>
-
-          <label>
-            Gabarito oficial
-            <textarea
-              rows={3}
-              value={lotDraft.answerKey}
-              onChange={(event) =>
-                setLotDraft((current) => ({ ...current, answerKey: event.target.value }))
-              }
-              placeholder="Digite a sequencia de respostas, ex.: ABCDEABCDE..."
-            />
-          </label>
-          <label>
-            Lista de alunos
-            <textarea
-              rows={6}
-              value={lotDraft.roster}
-              onChange={(event) =>
-                setLotDraft((current) => ({ ...current, roster: event.target.value }))
-              }
-              placeholder="Um nome por linha. Se deixar em branco, o sistema cria Aluno 1, Aluno 2..."
-            />
-          </label>
-
-          <button className="primary" onClick={() => void safely(saveLot)}>
-            Criar lote
-          </button>
-
-          <div className="stack">
-            {lots.map((lot) => (
-              <button
-                key={lot.id}
-                className={`list-button ${selectedLotId === lot.id ? "selected" : ""}`}
-                onClick={() => {
-                  setSelectedLotId(lot.id);
-                  setSelectedStudentId("");
-                }}
-              >
-                <strong>{lot.name}</strong>
-                <span>
-                  {lot.className} • {lot.questionCount} questoes • {lot.expectedStudentCount} alunos
-                </span>
-              </button>
-            ))}
-          </div>
-          </Card>
-        </section>
-      ) : null}
-
-      {activeView === "operacao" ? (
-        <section className="grid two operation-grid">
-          <Card
-            title="Captura iPhone"
-            description="Use a camera traseira ou importe uma foto da galeria. A grade de encaixe trava a folha e dispara automaticamente."
-          >
-          <div className="operation-banner">
-            <div>
-              <strong>Lote ativo</strong>
-              <p>{selectedLot ? `${selectedLot.name} • ${selectedLot.className}` : "Nenhum lote selecionado"}</p>
-            </div>
-            <div>
-              <strong>Auto captura</strong>
-              <label className="switch-row">
-                <input
-                  type="checkbox"
-                  checked={autoCaptureEnabled}
-                  onChange={(event) => setAutoCaptureEnabled(event.target.checked)}
-                />
-                <span>{autoCaptureEnabled ? "Ligada" : "Desligada"}</span>
-              </label>
-            </div>
-            <div>
-              <strong>OCR do caderno</strong>
-              <label className="switch-row">
-                <input
-                  type="checkbox"
-                  checked={ocrAssistEnabled}
-                  onChange={(event) => setOcrAssistEnabled(event.target.checked)}
-                />
-                <span>{ocrAssistEnabled ? "Ligado" : "Desligado"}</span>
-              </label>
-            </div>
-          </div>
-
-          <div className="capture-toolbar">
-            <button className="primary" onClick={() => void safely(startCamera)}>
-              Abrir camera
-            </button>
-            <button className="secondary" onClick={() => void stopCamera()}>
-              Fechar camera
-            </button>
-            <button className="secondary" onClick={() => fileInputRef.current?.click()}>
-              Enviar foto
-            </button>
-            <input
-              ref={fileInputRef}
-              hidden
-              type="file"
-              accept="image/*"
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                if (file) {
-                  void safely(() => handleImageFile(file));
-                }
-                event.target.value = "";
-              }}
-            />
-          </div>
-
-          <div className="camera-shell">
-            <video ref={videoRef} autoPlay muted playsInline />
-            <div className={`camera-guide ${guideStatus}`}>
-              <div className="guide-corners">
-                <span />
-                <span />
-                <span />
-                <span />
-              </div>
-              <div className="guide-grid" />
-              <div className="guide-label">
-                <strong>{guideLabelForStatus(guideStatus)}</strong>
-                <span>{Math.round(guideConfidence * 100)}% de encaixe</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="capture-status">
-            <p>{captureMessage}</p>
-            {cameraError ? <p className="error">{cameraError}</p> : null}
-            {busyMessage ? <p className="hint">{busyMessage}</p> : null}
-            <p className="hint">
-              Posicione o gabarito inteiro dentro da moldura. Para mais estabilidade no iPhone, comece com auto captura desligada e OCR desligado.
-            </p>
-          </div>
-
-          <button
-            className="primary large"
-            disabled={cameraState !== "live" || !selectedLot}
-            onClick={() => void safely(handleCaptureFromCamera)}
-          >
-            Capturar e ler
-          </button>
-          </Card>
-
-          <Card
-            title="Revisao e confirmacao"
-            description="Os casos com baixa confianca ficam editaveis antes da gravacao final."
-          >
-          {pendingScan ? (
-            <>
-              <div className="preview-grid">
-                <img src={pendingScan.imageUrl} alt="Captura original do gabarito" />
-                <img src={pendingScan.normalizedImage} alt="Imagem normalizada para leitura" />
-              </div>
-              <div className="scan-summary">
-                <MetricCard label="Acertos" value={String(pendingScan.correctCount)} />
-                <MetricCard label="Percentual" value={`${pendingScan.percent}%`} />
-                <MetricCard
-                  label="Confianca"
-                  value={`${Math.round(pendingScan.confidence * 100)}%`}
-                />
-                <MetricCard
-                  label="Revisar"
-                  value={String(
-                    new Set([
-                      ...pendingScan.ambiguousQuestions,
-                      ...pendingScan.blanks
-                    ]).size
-                  )}
-                />
-              </div>
-
-              <div className="note-block">
-                <strong>Modelo escolhido</strong>
-                <p>
-                  {pendingScan.template.name}
-                  {pendingScan.detectedBookletCode
-                    ? ` • codigo detectado ${pendingScan.detectedBookletCode}`
-                    : " • codigo do caderno nao detectado, usando modelo atual do lote"}
-                </p>
-                <p>
-                  A leitura foi executada somente no retangulo detectado do bloco do gabarito, sem processar a folha inteira.
-                </p>
-              </div>
-
+            <div className="form-grid">
               <label>
-                Aluno do lote
+                Nome do lote
+                <input
+                  value={lotDraft.name}
+                  onChange={(event) =>
+                    setLotDraft((current) => ({ ...current, name: event.target.value }))
+                  }
+                  placeholder="Ex.: 5A Matematica - Maio"
+                />
+              </label>
+              <label>
+                Turma
+                <input
+                  value={lotDraft.className}
+                  onChange={(event) =>
+                    setLotDraft((current) => ({ ...current, className: event.target.value }))
+                  }
+                  placeholder="Ex.: 5A"
+                />
+              </label>
+              <label>
+                Modelo
                 <select
-                  value={selectedStudentId}
-                  onChange={(event) => setSelectedStudentId(event.target.value)}
+                  value={lotDraft.templateId}
+                  onChange={(event) =>
+                    setLotDraft((current) => ({ ...current, templateId: event.target.value }))
+                  }
                 >
-                  <option value="">Selecione o aluno</option>
-                  {lotStudents.map((student) => (
-                    <option
-                      key={student.id}
-                      value={student.id}
-                      disabled={selectedStudentScanIds.has(student.id)}
-                    >
-                      {student.name}
-                      {selectedStudentScanIds.has(student.id) ? " (ja lido)" : ""}
+                  <option value="">Escolha um modelo</option>
+                  {templates.map((template) => (
+                    <option key={template.id} value={template.id}>
+                      {template.name}
+                      {template.bookletCode ? ` (${template.bookletCode})` : ""}
                     </option>
                   ))}
                 </select>
               </label>
+              <label>
+                Quantidade esperada de alunos
+                <input
+                  type="number"
+                  min={1}
+                  max={500}
+                  value={lotDraft.expectedStudentCount}
+                  onChange={(event) =>
+                    setLotDraft((current) => ({
+                      ...current,
+                      expectedStudentCount: Number(event.target.value)
+                    }))
+                  }
+                />
+              </label>
+            </div>
 
-              <div className="answers-grid">
-                {pendingScan.finalAnswers.map((answer, index) => {
-                  const needsReview =
-                    pendingScan.ambiguousQuestions.includes(index) || pendingScan.blanks.includes(index);
-                  return (
-                    <div key={index} className={`answer-card ${needsReview ? "warn" : ""}`}>
-                      <span>Q{index + 1}</span>
-                      <select
-                        value={answer}
-                        onChange={(event) =>
-                          updatePendingAnswer(index, event.target.value as AlternativeLabel)
-                        }
-                      >
-                        {alternativeLabels
-                          .slice(0, pendingScan.template.alternativesCount)
-                          .map((label) => (
-                            <option key={label} value={label}>
-                              {label}
-                            </option>
-                          ))}
-                      </select>
-                    </div>
-                  );
-                })}
-              </div>
+            <label>
+              Gabarito oficial
+              <textarea
+                rows={3}
+                value={lotDraft.answerKey}
+                onChange={(event) =>
+                  setLotDraft((current) => ({ ...current, answerKey: event.target.value }))
+                }
+                placeholder="Digite a sequencia de respostas, ex.: ABCDABCD..."
+              />
+            </label>
+            <label>
+              Lista de alunos
+              <textarea
+                rows={6}
+                value={lotDraft.roster}
+                onChange={(event) =>
+                  setLotDraft((current) => ({ ...current, roster: event.target.value }))
+                }
+                placeholder="Um nome por linha. Se deixar em branco, o sistema cria Aluno 1, Aluno 2..."
+              />
+            </label>
 
-              <div className="capture-toolbar">
-                <button className="secondary" onClick={() => setPendingScan(null)}>
-                  Descartar leitura
-                </button>
+            <button className="primary" onClick={() => void safely(saveLot)}>
+              Criar lote
+            </button>
+
+            <div className="stack">
+              {lots.map((lot) => (
                 <button
-                  className="primary"
-                  disabled={!selectedStudentId}
-                  onClick={() => void safely(confirmPendingScan)}
+                  key={lot.id}
+                  className={`list-button ${selectedLotId === lot.id ? "selected" : ""}`}
+                  onClick={() => {
+                    setSelectedLotId(lot.id);
+                    setSelectedStudentId("");
+                    setCaptureDraft(null);
+                    setPendingScan(null);
+                  }}
                 >
-                  Confirmar leitura
+                  <strong>{lot.name}</strong>
+                  <span>
+                    {lot.className} • {lot.questionCount} questoes • {lot.expectedStudentCount} alunos
+                  </span>
                 </button>
-              </div>
-            </>
-          ) : (
-            <p className="empty-state">
-              Nenhuma folha em revisao. Capture ou envie uma foto para gerar a primeira leitura.
-            </p>
-          )}
+              ))}
+            </div>
           </Card>
         </section>
       ) : null}
@@ -1249,75 +1149,74 @@ export default function App() {
             title="Resultados do lote"
             description="Acompanhe os percentuais por aluno e exporte o fechamento da turma em CSV."
           >
-          {selectedLot ? (
-            <>
-              <div className="lot-summary">
-                <p>
-                  <strong>{selectedLot.name}</strong> • {selectedLot.className}
-                </p>
-                <p>
-                  {lotScans.length} de {selectedLot.expectedStudentCount} provas confirmadas
-                </p>
-              </div>
-              <div className="stack compact">
-                {lotScans.map((scan) => {
-                  const student = lotStudents.find((item) => item.id === scan.studentId);
-                  return (
-                    <article key={scan.id} className="result-row">
-                      <div>
-                        <strong>{student?.name ?? "Sem aluno"}</strong>
-                        <span>{formatDate(scan.createdAt)}</span>
-                      </div>
-                      <div>
-                        <strong>{scan.percent}%</strong>
-                        <span>{scan.correctCount} acertos</span>
-                      </div>
-                    </article>
-                  );
-                })}
-              </div>
-              <button
-                className="primary"
-                disabled={lotScans.length === 0}
-                onClick={() => void exportLotCsv(selectedLot, lotScans, lotStudents)}
-              >
-                Exportar CSV deste lote
-              </button>
-            </>
-          ) : (
-            <p className="empty-state">Selecione um lote para acompanhar o fechamento.</p>
-          )}
+            {selectedLot ? (
+              <>
+                <div className="lot-summary">
+                  <p>
+                    <strong>{selectedLot.name}</strong> • {selectedLot.className}
+                  </p>
+                  <p>
+                    {lotScans.length} de {selectedLot.expectedStudentCount} provas confirmadas
+                  </p>
+                </div>
+                <div className="stack compact">
+                  {lotScans.map((scan) => {
+                    const student = lotStudents.find((item) => item.id === scan.studentId);
+                    return (
+                      <article key={scan.id} className="result-row">
+                        <div>
+                          <strong>{student?.name ?? "Sem aluno"}</strong>
+                          <span>{formatDate(scan.createdAt)}</span>
+                        </div>
+                        <div>
+                          <strong>{scan.percent}%</strong>
+                          <span>{scan.correctCount} acertos</span>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+                <button
+                  className="primary"
+                  disabled={lotScans.length === 0}
+                  onClick={() => void exportLotCsv(selectedLot, lotScans, lotStudents)}
+                >
+                  Exportar CSV deste lote
+                </button>
+              </>
+            ) : (
+              <p className="empty-state">Selecione um lote para acompanhar o fechamento.</p>
+            )}
           </Card>
 
           <Card
             title="Base local"
-            description="Os dados ficam no navegador. Exporte backup JSON com frequencia para mover ou preservar a operacao."
+            description="Os dados ficam no navegador. Exporte backup JSON com frequencia para preservar a operacao."
           >
-          <div className="stack compact">
-            <button className="primary" onClick={() => void exportBackupJson()}>
-              Exportar backup JSON
-            </button>
-            <button className="secondary" onClick={() => importInputRef.current?.click()}>
-              Importar backup JSON
-            </button>
-            <input
-              ref={importInputRef}
-              hidden
-              type="file"
-              accept="application/json"
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                if (file) {
-                  void safely(() => onImportBackup(file));
-                }
-                event.target.value = "";
-              }}
-            />
-            <p className="hint">
-              Dica operacional: como o GitHub Pages nao oferece backend, use o mesmo navegador do
-              iPhone no dia a dia e exporte backup ao fim de cada lote.
-            </p>
-          </div>
+            <div className="stack compact">
+              <button className="primary" onClick={() => void exportBackupJson()}>
+                Exportar backup JSON
+              </button>
+              <button className="secondary" onClick={() => importInputRef.current?.click()}>
+                Importar backup JSON
+              </button>
+              <input
+                ref={importInputRef}
+                hidden
+                type="file"
+                accept="application/json"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) {
+                    void safely(() => onImportBackup(file));
+                  }
+                  event.target.value = "";
+                }}
+              />
+              <p className="hint">
+                Use o mesmo navegador do iPhone no dia a dia e exporte backup ao fim de cada lote.
+              </p>
+            </div>
           </Card>
         </section>
       ) : null}
@@ -1325,79 +1224,170 @@ export default function App() {
   );
 }
 
-function evaluateGuide(video: HTMLVideoElement) {
-  const canvas = document.createElement("canvas");
-  const width = 160;
-  const height = 220;
-  canvas.width = width;
-  canvas.height = height;
-  const context = canvas.getContext("2d", { willReadFrequently: true });
-  if (!context) {
-    return { score: 0 };
-  }
+function CropEditor({
+  imageUrl,
+  crop,
+  suggestedCrop,
+  onChange
+}: {
+  imageUrl: string;
+  crop: CropRect;
+  suggestedCrop: CropRect;
+  onChange: (nextCrop: CropRect) => void;
+}) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const interactionRef = useRef<{
+    mode: DragMode;
+    startX: number;
+    startY: number;
+    initialCrop: CropRect;
+  } | null>(null);
 
-  context.drawImage(video, 0, 0, width, height);
-  const { data } = context.getImageData(0, 0, width, height);
-  const guide = {
-    x: Math.round(width * 0.12),
-    y: Math.round(height * 0.1),
-    width: Math.round(width * 0.76),
-    height: Math.round(height * 0.8)
-  };
-
-  let guideBrightness = 0;
-  let guideCount = 0;
-  let marginBrightness = 0;
-  let marginCount = 0;
-  let brightInside = 0;
-
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const offset = (y * width + x) * 4;
-      const luminance =
-        data[offset] * 0.299 + data[offset + 1] * 0.587 + data[offset + 2] * 0.114;
-      const inside =
-        x >= guide.x &&
-        x <= guide.x + guide.width &&
-        y >= guide.y &&
-        y <= guide.y + guide.height;
-
-      if (inside) {
-        guideBrightness += luminance;
-        guideCount += 1;
-        if (luminance > 175) {
-          brightInside += 1;
-        }
-      } else {
-        marginBrightness += luminance;
-        marginCount += 1;
+  useEffect(() => {
+    function handlePointerMove(event: PointerEvent) {
+      const host = hostRef.current;
+      const interaction = interactionRef.current;
+      if (!host || !interaction) {
+        return;
       }
+      const rect = host.getBoundingClientRect();
+      const dx = (event.clientX - interaction.startX) / rect.width;
+      const dy = (event.clientY - interaction.startY) / rect.height;
+      const initial = interaction.initialCrop;
+      let next = initial;
+
+      switch (interaction.mode) {
+        case "move":
+          next = {
+            ...initial,
+            x: initial.x + dx,
+            y: initial.y + dy
+          };
+          break;
+        case "se":
+          next = {
+            ...initial,
+            width: initial.width + dx,
+            height: initial.height + dy
+          };
+          break;
+        case "sw":
+          next = {
+            x: initial.x + dx,
+            y: initial.y,
+            width: initial.width - dx,
+            height: initial.height + dy
+          };
+          break;
+        case "ne":
+          next = {
+            x: initial.x,
+            y: initial.y + dy,
+            width: initial.width + dx,
+            height: initial.height - dy
+          };
+          break;
+        case "nw":
+          next = {
+            x: initial.x + dx,
+            y: initial.y + dy,
+            width: initial.width - dx,
+            height: initial.height - dy
+          };
+          break;
+      }
+
+      onChange(clampCrop(next));
     }
+
+    function handlePointerUp() {
+      interactionRef.current = null;
+    }
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, [onChange]);
+
+  function startInteraction(event: React.PointerEvent, mode: DragMode) {
+    event.preventDefault();
+    interactionRef.current = {
+      mode,
+      startX: event.clientX,
+      startY: event.clientY,
+      initialCrop: crop
+    };
   }
 
-  const avgGuide = guideCount === 0 ? 0 : guideBrightness / guideCount;
-  const avgMargin = marginCount === 0 ? 0 : marginBrightness / marginCount;
-  const brightRatio = guideCount === 0 ? 0 : brightInside / guideCount;
+  return (
+    <div className="crop-stage">
+      <div className="crop-canvas" ref={hostRef}>
+        <img src={imageUrl} alt="Imagem preparada para recorte do gabarito" />
+        <div
+          className="suggested-crop"
+          style={{
+            left: `${suggestedCrop.x * 100}%`,
+            top: `${suggestedCrop.y * 100}%`,
+            width: `${suggestedCrop.width * 100}%`,
+            height: `${suggestedCrop.height * 100}%`
+          }}
+        />
+        <div
+          className="active-crop"
+          style={{
+            left: `${crop.x * 100}%`,
+            top: `${crop.y * 100}%`,
+            width: `${crop.width * 100}%`,
+            height: `${crop.height * 100}%`
+          }}
+          onPointerDown={(event) => startInteraction(event, "move")}
+        >
+          <button className="crop-handle nw" onPointerDown={(event) => startInteraction(event, "nw")} />
+          <button className="crop-handle ne" onPointerDown={(event) => startInteraction(event, "ne")} />
+          <button className="crop-handle sw" onPointerDown={(event) => startInteraction(event, "sw")} />
+          <button className="crop-handle se" onPointerDown={(event) => startInteraction(event, "se")} />
+        </div>
+      </div>
 
-  const centerContrast = Math.max(0, Math.min(1, (avgGuide - avgMargin + 35) / 120));
-  const whiteRatioScore = Math.max(0, Math.min(1, (brightRatio - 0.35) / 0.35));
-  const score = Number(((centerContrast * 0.55) + (whiteRatioScore * 0.45)).toFixed(3));
-  return { score };
-}
-
-function guideLabelForStatus(status: "idle" | "searching" | "aligning" | "locked" | "capturing") {
-  switch (status) {
-    case "searching":
-      return "Procure a folha";
-    case "aligning":
-      return "Ajuste o encaixe";
-    case "locked":
-      return "Folha travada";
-    case "capturing":
-      return "Capturando";
-    default:
-      return "Camera parada";
-  }
+      <div className="crop-sliders">
+        <SliderField
+          label="Posicao X"
+          value={crop.x}
+          min={0}
+          max={1 - crop.width}
+          step={0.01}
+          onChange={(value) => onChange({ ...crop, x: Number(value) })}
+        />
+        <SliderField
+          label="Posicao Y"
+          value={crop.y}
+          min={0}
+          max={1 - crop.height}
+          step={0.01}
+          onChange={(value) => onChange({ ...crop, y: Number(value) })}
+        />
+        <SliderField
+          label="Largura"
+          value={crop.width}
+          min={MIN_CROP_SIZE}
+          max={1 - crop.x}
+          step={0.01}
+          onChange={(value) => onChange({ ...crop, width: Number(value) })}
+        />
+        <SliderField
+          label="Altura"
+          value={crop.height}
+          min={MIN_CROP_SIZE}
+          max={1 - crop.y}
+          step={0.01}
+          onChange={(value) => onChange({ ...crop, height: Number(value) })}
+        />
+      </div>
+    </div>
+  );
 }
 
 function Card({

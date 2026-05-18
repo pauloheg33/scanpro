@@ -64,9 +64,20 @@ export type ScanRecord = {
 export type PendingScan = {
   lot: Lot;
   template: TemplateModel;
-  detectedBookletCode?: string;
   imageUrl: string;
   normalizedImage: string;
+  suggestedCrop: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+  confirmedCrop: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
   detectedAnswers: AlternativeLabel[];
   finalAnswers: AlternativeLabel[];
   ambiguousQuestions: number[];
