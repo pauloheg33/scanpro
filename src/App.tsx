@@ -47,6 +47,8 @@ type LotDraft = {
   roster: string;
 };
 
+type AppView = "operacao" | "lotes" | "modelos" | "resultados";
+
 const defaultTemplateDraft: TemplateDraft = {
   name: "",
   questionCount: 20,
@@ -150,8 +152,14 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [busyMessage, setBusyMessage] = useState("");
   const [notice, setNotice] = useState("");
+  const [activeView, setActiveView] = useState<AppView>("operacao");
   const [cameraState, setCameraState] = useState<"idle" | "live" | "error">("idle");
   const [cameraError, setCameraError] = useState("");
+  const [autoCaptureEnabled, setAutoCaptureEnabled] = useState(true);
+  const [guideStatus, setGuideStatus] = useState<
+    "idle" | "searching" | "aligning" | "locked" | "capturing"
+  >("idle");
+  const [guideConfidence, setGuideConfidence] = useState(0);
   const [captureMessage, setCaptureMessage] = useState(
     "Cadastre ou escolha um lote, abra a camera e fotografe um gabarito por vez."
   );
@@ -163,6 +171,9 @@ export default function App() {
   const setPendingScan = useAppStore((state) => state.setPendingScan);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const autoCaptureBusyRef = useRef(false);
+  const autoCaptureFrameRef = useRef<number | null>(null);
+  const stableFrameCountRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -213,6 +224,68 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (cameraState !== "live" || !autoCaptureEnabled || pendingScan) {
+      if (autoCaptureFrameRef.current) {
+        cancelAnimationFrame(autoCaptureFrameRef.current);
+        autoCaptureFrameRef.current = null;
+      }
+      stableFrameCountRef.current = 0;
+      if (cameraState !== "live") {
+        setGuideStatus("idle");
+        setGuideConfidence(0);
+      }
+      return;
+    }
+
+    const loop = () => {
+      const video = videoRef.current;
+      if (!video || video.readyState < 2 || autoCaptureBusyRef.current) {
+        autoCaptureFrameRef.current = requestAnimationFrame(loop);
+        return;
+      }
+
+      const guide = evaluateGuide(video);
+      setGuideConfidence(guide.score);
+
+      if (guide.score > 0.86) {
+        stableFrameCountRef.current += 1;
+        setGuideStatus(stableFrameCountRef.current >= 6 ? "locked" : "aligning");
+      } else if (guide.score > 0.62) {
+        stableFrameCountRef.current = Math.max(0, stableFrameCountRef.current - 1);
+        setGuideStatus("aligning");
+      } else {
+        stableFrameCountRef.current = 0;
+        setGuideStatus("searching");
+      }
+
+      if (stableFrameCountRef.current >= 6) {
+        autoCaptureBusyRef.current = true;
+        setGuideStatus("capturing");
+        setCaptureMessage("Folha alinhada. Disparando a captura automaticamente...");
+        void safely(async () => {
+          await handleCaptureFromCamera();
+        }).finally(() => {
+          stableFrameCountRef.current = 0;
+          autoCaptureBusyRef.current = false;
+        });
+        return;
+      }
+
+      autoCaptureFrameRef.current = requestAnimationFrame(loop);
+    };
+
+    setGuideStatus("searching");
+    autoCaptureFrameRef.current = requestAnimationFrame(loop);
+
+    return () => {
+      if (autoCaptureFrameRef.current) {
+        cancelAnimationFrame(autoCaptureFrameRef.current);
+        autoCaptureFrameRef.current = null;
+      }
+    };
+  }, [autoCaptureEnabled, cameraState, pendingScan]);
+
   async function refreshAll() {
     const [nextTemplates, nextLots, nextStudents, nextScans] = await Promise.all([
       db.templates.orderBy("createdAt").reverse().toArray(),
@@ -234,6 +307,8 @@ export default function App() {
       streamRef.current = null;
     }
     setCameraState("idle");
+    setGuideStatus("idle");
+    setGuideConfidence(0);
   }
 
   async function startCamera() {
@@ -254,7 +329,7 @@ export default function App() {
         await videoRef.current.play();
       }
       setCameraState("live");
-      setCaptureMessage("Camera pronta. Enquadre a folha dentro da area e capture.");
+      setCaptureMessage("Camera pronta. Alinhe a folha na grade; o app dispara sozinho quando travar.");
     } catch (error) {
       setCameraState("error");
       setCameraError("Nao foi possivel abrir a camera. Use a galeria como plano B.");
@@ -408,6 +483,7 @@ export default function App() {
     setPendingScan(nextPending);
     setBusyMessage("");
     setNotice("");
+    setGuideStatus("idle");
     setCaptureMessage("Leitura pronta. Revise e confirme o aluno.");
   }
 
@@ -452,7 +528,7 @@ export default function App() {
     setPendingScan(null);
     setSelectedStudentId("");
     setNotice("Leitura confirmada e salva na base local.");
-    setCaptureMessage("Leitura salva. Pode seguir para o proximo aluno.");
+    setCaptureMessage("Leitura salva. Aponte a proxima folha para nova captura automatica.");
     await refreshAll();
   }
 
@@ -511,16 +587,15 @@ export default function App() {
 
   return (
     <main className="shell">
-      <section className="hero">
-        <div>
+      <section className="app-topbar">
+        <div className="brand-block">
           <p className="eyebrow">iPhone-first OMR</p>
           <h1>SCANPRO</h1>
           <p className="hero-copy">
-            Leitura local de gabaritos existentes com captura guiada, calibracao por modelo e
-            revisao humana dos casos incertos.
+            Operacao mobile para leitura de gabaritos PROEA com enquadramento guiado, disparo automatico e revisao humana.
           </p>
         </div>
-        <div className="hero-stats">
+        <div className="hero-stats compact">
           <MetricCard label="Modelos" value={String(overview.templates)} />
           <MetricCard label="Lotes" value={String(overview.lots)} />
           <MetricCard label="Leituras" value={String(overview.scans)} />
@@ -528,13 +603,41 @@ export default function App() {
         </div>
       </section>
 
+      <nav className="app-nav">
+        <button
+          className={`nav-pill ${activeView === "operacao" ? "active" : ""}`}
+          onClick={() => setActiveView("operacao")}
+        >
+          Operacao
+        </button>
+        <button
+          className={`nav-pill ${activeView === "lotes" ? "active" : ""}`}
+          onClick={() => setActiveView("lotes")}
+        >
+          Lotes
+        </button>
+        <button
+          className={`nav-pill ${activeView === "modelos" ? "active" : ""}`}
+          onClick={() => setActiveView("modelos")}
+        >
+          Modelos
+        </button>
+        <button
+          className={`nav-pill ${activeView === "resultados" ? "active" : ""}`}
+          onClick={() => setActiveView("resultados")}
+        >
+          Resultados
+        </button>
+      </nav>
+
       {notice ? <div className="notice">{notice}</div> : null}
 
-      <section className="grid two">
-        <Card
-          title="1. Modelo calibrado"
-          description="Cadastre a geometria base dos gabaritos existentes. Ajuste a regiao onde ficam as bolhas e a quantidade de colunas."
-        >
+      {activeView === "modelos" ? (
+        <section className="grid single">
+          <Card
+            title="Modelos calibrados"
+            description="Cadastre a geometria base dos gabaritos existentes. Ajuste a regiao onde ficam as bolhas e a quantidade de colunas."
+          >
           <div className="form-grid">
             <label>
               Nome do modelo
@@ -736,12 +839,16 @@ export default function App() {
               </button>
             ))}
           </div>
-        </Card>
+          </Card>
+        </section>
+      ) : null}
 
-        <Card
-          title="2. Lote e gabarito"
-          description="Crie a turma, informe o gabarito oficial e monte a lista de alunos que receberao as leituras."
-        >
+      {activeView === "lotes" ? (
+        <section className="grid single">
+          <Card
+            title="Lotes e gabaritos"
+            description="Crie a turma, informe o gabarito oficial e monte a lista de alunos que receberao as leituras."
+          >
           <div className="form-grid">
             <label>
               Nome do lote
@@ -841,14 +948,34 @@ export default function App() {
               </button>
             ))}
           </div>
-        </Card>
-      </section>
+          </Card>
+        </section>
+      ) : null}
 
-      <section className="grid two">
-        <Card
-          title="3. Captura iPhone"
-          description="Use a camera traseira ou importe uma foto da galeria. O fluxo principal foi pensado para uma folha por vez."
-        >
+      {activeView === "operacao" ? (
+        <section className="grid two operation-grid">
+          <Card
+            title="Captura iPhone"
+            description="Use a camera traseira ou importe uma foto da galeria. A grade de encaixe trava a folha e dispara automaticamente."
+          >
+          <div className="operation-banner">
+            <div>
+              <strong>Lote ativo</strong>
+              <p>{selectedLot ? `${selectedLot.name} • ${selectedLot.className}` : "Nenhum lote selecionado"}</p>
+            </div>
+            <div>
+              <strong>Auto captura</strong>
+              <label className="switch-row">
+                <input
+                  type="checkbox"
+                  checked={autoCaptureEnabled}
+                  onChange={(event) => setAutoCaptureEnabled(event.target.checked)}
+                />
+                <span>{autoCaptureEnabled ? "Ligada" : "Desligada"}</span>
+              </label>
+            </div>
+          </div>
+
           <div className="capture-toolbar">
             <button className="primary" onClick={() => void safely(startCamera)}>
               Abrir camera
@@ -876,13 +1003,28 @@ export default function App() {
 
           <div className="camera-shell">
             <video ref={videoRef} autoPlay muted playsInline />
-            <div className="camera-guide" />
+            <div className={`camera-guide ${guideStatus}`}>
+              <div className="guide-corners">
+                <span />
+                <span />
+                <span />
+                <span />
+              </div>
+              <div className="guide-grid" />
+              <div className="guide-label">
+                <strong>{guideLabelForStatus(guideStatus)}</strong>
+                <span>{Math.round(guideConfidence * 100)}% de encaixe</span>
+              </div>
+            </div>
           </div>
 
           <div className="capture-status">
             <p>{captureMessage}</p>
             {cameraError ? <p className="error">{cameraError}</p> : null}
             {busyMessage ? <p className="hint">{busyMessage}</p> : null}
+            <p className="hint">
+              Posicione o gabarito inteiro dentro da moldura. Quando o app detectar estabilidade e alinhamento, ele fotografa sozinho.
+            </p>
           </div>
 
           <button
@@ -892,12 +1034,12 @@ export default function App() {
           >
             Capturar e ler
           </button>
-        </Card>
+          </Card>
 
-        <Card
-          title="4. Revisao e confirmacao"
-          description="Os casos com baixa confianca ficam editaveis antes da gravacao final."
-        >
+          <Card
+            title="Revisao e confirmacao"
+            description="Os casos com baixa confianca ficam editaveis antes da gravacao final."
+          >
           {pendingScan ? (
             <>
               <div className="preview-grid">
@@ -996,14 +1138,16 @@ export default function App() {
               Nenhuma folha em revisao. Capture ou envie uma foto para gerar a primeira leitura.
             </p>
           )}
-        </Card>
-      </section>
+          </Card>
+        </section>
+      ) : null}
 
-      <section className="grid two">
-        <Card
-          title="5. Resultados do lote"
-          description="Acompanhe os percentuais por aluno e exporte o fechamento da turma em CSV."
-        >
+      {activeView === "resultados" ? (
+        <section className="grid two">
+          <Card
+            title="Resultados do lote"
+            description="Acompanhe os percentuais por aluno e exporte o fechamento da turma em CSV."
+          >
           {selectedLot ? (
             <>
               <div className="lot-summary">
@@ -1042,12 +1186,12 @@ export default function App() {
           ) : (
             <p className="empty-state">Selecione um lote para acompanhar o fechamento.</p>
           )}
-        </Card>
+          </Card>
 
-        <Card
-          title="6. Base local"
-          description="Os dados ficam no navegador. Exporte backup JSON com frequencia para mover ou preservar a operacao."
-        >
+          <Card
+            title="Base local"
+            description="Os dados ficam no navegador. Exporte backup JSON com frequencia para mover ou preservar a operacao."
+          >
           <div className="stack compact">
             <button className="primary" onClick={() => void exportBackupJson()}>
               Exportar backup JSON
@@ -1073,10 +1217,86 @@ export default function App() {
               iPhone no dia a dia e exporte backup ao fim de cada lote.
             </p>
           </div>
-        </Card>
-      </section>
+          </Card>
+        </section>
+      ) : null}
     </main>
   );
+}
+
+function evaluateGuide(video: HTMLVideoElement) {
+  const canvas = document.createElement("canvas");
+  const width = 160;
+  const height = 220;
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) {
+    return { score: 0 };
+  }
+
+  context.drawImage(video, 0, 0, width, height);
+  const { data } = context.getImageData(0, 0, width, height);
+  const guide = {
+    x: Math.round(width * 0.12),
+    y: Math.round(height * 0.1),
+    width: Math.round(width * 0.76),
+    height: Math.round(height * 0.8)
+  };
+
+  let guideBrightness = 0;
+  let guideCount = 0;
+  let marginBrightness = 0;
+  let marginCount = 0;
+  let brightInside = 0;
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const offset = (y * width + x) * 4;
+      const luminance =
+        data[offset] * 0.299 + data[offset + 1] * 0.587 + data[offset + 2] * 0.114;
+      const inside =
+        x >= guide.x &&
+        x <= guide.x + guide.width &&
+        y >= guide.y &&
+        y <= guide.y + guide.height;
+
+      if (inside) {
+        guideBrightness += luminance;
+        guideCount += 1;
+        if (luminance > 175) {
+          brightInside += 1;
+        }
+      } else {
+        marginBrightness += luminance;
+        marginCount += 1;
+      }
+    }
+  }
+
+  const avgGuide = guideCount === 0 ? 0 : guideBrightness / guideCount;
+  const avgMargin = marginCount === 0 ? 0 : marginBrightness / marginCount;
+  const brightRatio = guideCount === 0 ? 0 : brightInside / guideCount;
+
+  const centerContrast = Math.max(0, Math.min(1, (avgGuide - avgMargin + 35) / 120));
+  const whiteRatioScore = Math.max(0, Math.min(1, (brightRatio - 0.35) / 0.35));
+  const score = Number(((centerContrast * 0.55) + (whiteRatioScore * 0.45)).toFixed(3));
+  return { score };
+}
+
+function guideLabelForStatus(status: "idle" | "searching" | "aligning" | "locked" | "capturing") {
+  switch (status) {
+    case "searching":
+      return "Procure a folha";
+    case "aligning":
+      return "Ajuste o encaixe";
+    case "locked":
+      return "Folha travada";
+    case "capturing":
+      return "Capturando";
+    default:
+      return "Camera parada";
+  }
 }
 
 function Card({

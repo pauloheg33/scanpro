@@ -58,11 +58,16 @@ video {
   padding: 1.5rem 1rem 4rem;
 }
 
-.hero {
+.app-topbar {
   display: grid;
   gap: 1.25rem;
   align-items: start;
-  padding: 1.2rem 0 1.5rem;
+  padding: 1rem 0 1.25rem;
+}
+
+.brand-block {
+  display: grid;
+  gap: 0.4rem;
 }
 
 .eyebrow {
@@ -92,6 +97,39 @@ video {
   gap: 0.75rem;
 }
 
+.hero-stats.compact .metric {
+  padding-block: 0.8rem;
+}
+
+.app-nav {
+  position: sticky;
+  top: 0.6rem;
+  z-index: 20;
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  padding: 0.55rem;
+  margin-bottom: 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 1.25rem;
+  background: rgba(255, 251, 245, 0.86);
+  backdrop-filter: blur(16px);
+  box-shadow: var(--shadow);
+}
+
+.nav-pill {
+  min-height: 2.75rem;
+  padding: 0.75rem 1rem;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+}
+
+.nav-pill.active {
+  background: var(--primary);
+  color: white;
+}
+
 .grid {
   display: grid;
   gap: 1rem;
@@ -108,6 +146,10 @@ video {
 }
 
 .grid.two {
+  grid-template-columns: 1fr;
+}
+
+.grid.single {
   grid-template-columns: 1fr;
 }
 
@@ -286,6 +328,43 @@ textarea {
   margin-bottom: 0.8rem;
 }
 
+.operation-grid {
+  align-items: start;
+}
+
+.operation-banner {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 0.9rem;
+  padding: 0.9rem 1rem;
+  border-radius: 1rem;
+  background: rgba(16, 51, 58, 0.06);
+  border: 1px solid var(--border);
+}
+
+.operation-banner strong {
+  display: block;
+}
+
+.operation-banner p {
+  margin: 0.25rem 0 0;
+  color: var(--muted);
+}
+
+.switch-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin-top: 0.4rem;
+}
+
+.switch-row input {
+  width: 1.05rem;
+  height: 1.05rem;
+  padding: 0;
+}
+
 .camera-shell {
   position: relative;
   overflow: hidden;
@@ -303,9 +382,111 @@ textarea {
 .camera-guide {
   position: absolute;
   inset: 10% 12%;
-  border: 3px solid rgba(255, 255, 255, 0.75);
   border-radius: 1.4rem;
   box-shadow: 0 0 0 200vmax rgba(8, 21, 25, 0.25);
+  transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.camera-guide::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 1.4rem;
+  border: 3px solid rgba(255, 255, 255, 0.74);
+}
+
+.camera-guide.searching::before {
+  border-color: rgba(255, 255, 255, 0.55);
+}
+
+.camera-guide.aligning::before {
+  border-color: rgba(228, 138, 61, 0.95);
+}
+
+.camera-guide.locked::before {
+  border-color: rgba(91, 199, 131, 0.95);
+  box-shadow: 0 0 0 6px rgba(91, 199, 131, 0.16);
+}
+
+.camera-guide.capturing::before {
+  border-color: rgba(91, 199, 131, 1);
+  box-shadow: 0 0 0 10px rgba(91, 199, 131, 0.26);
+  transform: scale(0.985);
+}
+
+.guide-corners span {
+  position: absolute;
+  width: 1.2rem;
+  height: 1.2rem;
+  border-color: white;
+  border-style: solid;
+  border-width: 0;
+}
+
+.guide-corners span:nth-child(1) {
+  top: -0.12rem;
+  left: -0.12rem;
+  border-top-width: 4px;
+  border-left-width: 4px;
+  border-top-left-radius: 0.8rem;
+}
+
+.guide-corners span:nth-child(2) {
+  top: -0.12rem;
+  right: -0.12rem;
+  border-top-width: 4px;
+  border-right-width: 4px;
+  border-top-right-radius: 0.8rem;
+}
+
+.guide-corners span:nth-child(3) {
+  bottom: -0.12rem;
+  left: -0.12rem;
+  border-bottom-width: 4px;
+  border-left-width: 4px;
+  border-bottom-left-radius: 0.8rem;
+}
+
+.guide-corners span:nth-child(4) {
+  right: -0.12rem;
+  bottom: -0.12rem;
+  border-right-width: 4px;
+  border-bottom-width: 4px;
+  border-bottom-right-radius: 0.8rem;
+}
+
+.guide-grid {
+  position: absolute;
+  inset: 7%;
+  border-radius: 1rem;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.14) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.14) 1px, transparent 1px);
+  background-size: 33.333% 33.333%;
+}
+
+.guide-label {
+  position: absolute;
+  left: 50%;
+  bottom: 0.8rem;
+  transform: translateX(-50%);
+  min-width: 10rem;
+  text-align: center;
+  padding: 0.55rem 0.8rem;
+  border-radius: 999px;
+  background: rgba(8, 21, 25, 0.58);
+  color: white;
+  backdrop-filter: blur(10px);
+}
+
+.guide-label strong,
+.guide-label span {
+  display: block;
+}
+
+.guide-label span {
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 0.8rem;
 }
 
 .capture-status {
@@ -396,7 +577,7 @@ textarea {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .hero {
+  .app-topbar {
     grid-template-columns: 1.6fr 1fr;
   }
 
@@ -427,13 +608,25 @@ textarea {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .operation-banner {
+    grid-template-columns: 1fr;
+  }
+
   .capture-toolbar {
     flex-direction: column;
   }
 
   .primary,
   .secondary,
-  .list-button {
+  .list-button,
+  .nav-pill {
     width: 100%;
+  }
+
+  .app-nav {
+    top: auto;
+    bottom: 0;
+    position: sticky;
+    margin-top: 1rem;
   }
 }
