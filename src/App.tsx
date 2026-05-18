@@ -59,6 +59,8 @@ type CropRect = {
 type CaptureDraft = {
   lot: Lot;
   template: TemplateModel;
+  fileName: string;
+  fileSizeKb: number;
   imageUrl: string;
   normalizedImage: string;
   suggestedCrop: CropRect;
@@ -193,6 +195,9 @@ export default function App() {
   const [selectedStudentId, setSelectedStudentId] = useState("");
   const [activePreviewTemplateId, setActivePreviewTemplateId] = useState("");
   const [captureDraft, setCaptureDraft] = useState<CaptureDraft | null>(null);
+  const [operationStage, setOperationStage] = useState<
+    "idle" | "photo-received" | "crop-ready" | "analyzing" | "review-ready"
+  >("idle");
   const selectedLotId = useAppStore((state) => state.selectedLotId);
   const pendingScan = useAppStore((state) => state.pendingScan);
   const setSelectedLotId = useAppStore((state) => state.setSelectedLotId);
@@ -200,6 +205,7 @@ export default function App() {
   const captureInputRef = useRef<HTMLInputElement | null>(null);
   const galleryInputRef = useRef<HTMLInputElement | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
+  const operationFocusRef = useRef<HTMLDivElement | null>(null);
 
   const selectedLot = useMemo(
     () => lots.find((lot) => lot.id === selectedLotId) ?? null,
@@ -260,6 +266,19 @@ export default function App() {
 
     void loadAll();
   }, [selectedLotId, setSelectedLotId]);
+
+  useEffect(() => {
+    if (!captureDraft && !pendingScan) {
+      return;
+    }
+    const node = operationFocusRef.current;
+    if (!node) {
+      return;
+    }
+    window.setTimeout(() => {
+      node.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 120);
+  }, [captureDraft, pendingScan]);
 
   async function refreshAll() {
     const [nextTemplates, nextLots, nextStudents, nextScans] = await Promise.all([
@@ -368,6 +387,7 @@ export default function App() {
       throw new Error("Escolha um lote com modelo definido antes de fotografar.");
     }
 
+    setOperationStage("photo-received");
     setBusyMessage("Preparando a foto do gabarito...");
     const imageUrl = await fileToDataUrl(file);
     const originalCanvas = await drawImageToCanvas(imageUrl);
@@ -388,12 +408,16 @@ export default function App() {
     setCaptureDraft({
       lot: selectedLot,
       template: selectedTemplate,
+      fileName: file.name || "foto-do-gabarito.jpg",
+      fileSizeKb: Math.max(1, Math.round(file.size / 1024)),
       imageUrl,
       normalizedImage: canvasToDataUrl(normalizedCanvas),
       suggestedCrop,
       confirmedCrop: suggestedCrop
     });
     setBusyMessage("");
+    setNotice("Foto recebida com sucesso. Agora ajuste o recorte do gabarito.");
+    setOperationStage("crop-ready");
     setCaptureMessage("Ajuste o recorte para conter apenas o bloco do gabarito e confirme a analise.");
     setPendingScan(null);
     setSelectedStudentId("");
@@ -404,6 +428,7 @@ export default function App() {
       return;
     }
 
+    setOperationStage("analyzing");
     setBusyMessage("Recortando o bloco confirmado do gabarito...");
     const normalizedCanvas = await drawImageToCanvas(captureDraft.normalizedImage);
     const finalCrop = clampCrop(captureDraft.confirmedCrop);
@@ -446,6 +471,8 @@ export default function App() {
     setPendingScan(nextPending);
     setCaptureDraft(null);
     setBusyMessage("");
+    setNotice("Analise concluida. Confira as respostas detectadas abaixo.");
+    setOperationStage("review-ready");
     setCaptureMessage("Leitura pronta. Confira as respostas e confirme o aluno.");
   }
 
@@ -477,6 +504,7 @@ export default function App() {
     setPendingScan(null);
     setSelectedStudentId("");
     setNotice("Leitura confirmada e salva na base local.");
+    setOperationStage("idle");
     setCaptureMessage("Leitura salva. Fotografe o proximo gabarito.");
     await refreshAll();
   }
@@ -525,6 +553,7 @@ export default function App() {
       const message = error instanceof Error ? error.message : "Ocorreu um erro inesperado.";
       setNotice(message);
       setBusyMessage("");
+      setOperationStage("idle");
       console.error(error);
     }
   }
@@ -609,6 +638,13 @@ export default function App() {
             title="Fotografar gabarito"
             description="Use a camera nativa do iPhone ou a galeria. A foto deve mostrar somente a area do gabarito."
           >
+            <div className="stage-strip">
+              <div className={`stage-pill ${operationStage === "idle" ? "active" : ""}`}>1. Foto</div>
+              <div className={`stage-pill ${operationStage === "photo-received" || operationStage === "crop-ready" ? "active" : ""}`}>2. Recorte</div>
+              <div className={`stage-pill ${operationStage === "analyzing" ? "active" : ""}`}>3. Analise</div>
+              <div className={`stage-pill ${operationStage === "review-ready" ? "active" : ""}`}>4. Revisao</div>
+            </div>
+
             <div className="operation-banner three">
               <div>
                 <strong>Lote ativo</strong>
@@ -699,8 +735,14 @@ export default function App() {
                   : "Depois da foto, o sistema vai sugerir um recorte e so entao analisar o gabarito."
             }
           >
+            <div ref={operationFocusRef} />
             {captureDraft ? (
               <>
+                <div className="receipt-card">
+                  <strong>Foto recebida</strong>
+                  <p>{captureDraft.fileName}</p>
+                  <p>{captureDraft.fileSizeKb} KB • modelo {captureDraft.template.name}</p>
+                </div>
                 <CropEditor
                   imageUrl={captureDraft.normalizedImage}
                   crop={captureDraft.confirmedCrop}
@@ -721,6 +763,7 @@ export default function App() {
                     className="secondary"
                     onClick={() => {
                       setCaptureDraft(null);
+                      setOperationStage("idle");
                       setCaptureMessage("Capture novamente somente o bloco do gabarito.");
                     }}
                   >
@@ -745,6 +788,10 @@ export default function App() {
               </>
             ) : pendingScan ? (
               <>
+                <div className="receipt-card success">
+                  <strong>Leitura gerada</strong>
+                  <p>O gabarito foi analisado. Agora confira e confirme o aluno.</p>
+                </div>
                 <div className="preview-grid">
                   <img src={pendingScan.imageUrl} alt="Foto original do gabarito" />
                   <img src={pendingScan.normalizedImage} alt="Recorte usado para leitura" />
