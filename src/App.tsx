@@ -166,7 +166,8 @@ export default function App() {
   const [activeView, setActiveView] = useState<AppView>("operacao");
   const [cameraState, setCameraState] = useState<"idle" | "live" | "error">("idle");
   const [cameraError, setCameraError] = useState("");
-  const [autoCaptureEnabled, setAutoCaptureEnabled] = useState(true);
+  const [autoCaptureEnabled, setAutoCaptureEnabled] = useState(false);
+  const [ocrAssistEnabled, setOcrAssistEnabled] = useState(false);
   const [guideStatus, setGuideStatus] = useState<
     "idle" | "searching" | "aligning" | "locked" | "capturing"
   >("idle");
@@ -221,6 +222,18 @@ export default function App() {
       setLots(nextLots);
       setStudents(nextStudents);
       setScans(nextScans);
+      if (nextTemplates.length === 0) {
+        const now = new Date().toISOString();
+        await db.templates.bulkPut(
+          proeaTemplatePresets.map((preset) => ({
+            ...preset,
+            createdAt: now
+          }))
+        );
+        const seededTemplates = await db.templates.orderBy("createdAt").reverse().toArray();
+        setTemplates(seededTemplates);
+        setNotice("Modelos PROEA carregados automaticamente para facilitar a primeira leitura.");
+      }
       if (!selectedLotId && nextLots[0]) {
         setSelectedLotId(nextLots[0].id);
       }
@@ -343,7 +356,11 @@ export default function App() {
         await videoRef.current.play();
       }
       setCameraState("live");
-      setCaptureMessage("Camera pronta. Alinhe a folha na grade; o app dispara sozinho quando travar.");
+      setCaptureMessage(
+        autoCaptureEnabled
+          ? "Camera pronta. Alinhe a folha na grade; o app dispara sozinho quando travar."
+          : "Camera pronta. Alinhe a folha na grade e use o botao Capturar para evitar travamentos."
+      );
     } catch (error) {
       setCameraState("error");
       setCameraError("Nao foi possivel abrir a camera. Use a galeria como plano B.");
@@ -448,102 +465,113 @@ export default function App() {
     if (!selectedLot) {
       throw new Error("Escolha um lote ativo antes de capturar.");
     }
-
-    setBusyMessage("Preparando imagem e aplicando normalizacao...");
-    const canvas = await drawImageToCanvas(dataUrl);
-    let templateForAnalysis = selectedTemplate;
-    let nextNotice = "";
-
-    let bookletDetection: BookletDetection = { code: null, rawText: "" };
-    if (selectedTemplate?.bookletCode || templates.some((template) => template.bookletCode)) {
-      setBusyMessage("Identificando o codigo do caderno...");
-      bookletDetection = await detectBookletCodeFromCanvas(canvas);
+    if (autoCaptureBusyRef.current) {
+      return;
     }
+    autoCaptureBusyRef.current = true;
 
-    if (bookletDetection.code && selectedLot.templateId) {
-      const matchedTemplate = templates.find((template) => template.bookletCode === bookletDetection.code);
+    try {
+      setBusyMessage("Preparando imagem e aplicando normalizacao...");
+      const canvas = await drawImageToCanvas(dataUrl);
+      let templateForAnalysis = selectedTemplate;
+      let nextNotice = "";
+
+      let bookletDetection: BookletDetection = { code: null, rawText: "" };
       const lotTemplate = templates.find((template) => template.id === selectedLot.templateId) ?? null;
-      if (matchedTemplate && lotTemplate?.bookletCode === bookletDetection.code) {
-        templateForAnalysis = matchedTemplate;
-        nextNotice = `Codigo do caderno detectado: ${bookletDetection.code}. Modelo confirmado automaticamente.`;
-      } else if (matchedTemplate && lotTemplate?.bookletCode && lotTemplate.bookletCode !== bookletDetection.code) {
-        nextNotice = `Codigo detectado ${bookletDetection.code}, mas o lote ativo espera ${lotTemplate.bookletCode}. Mantendo o modelo do lote para evitar correcao errada.`;
-      } else if (matchedTemplate && !lotTemplate?.bookletCode) {
-        templateForAnalysis = matchedTemplate;
-        nextNotice = `Codigo do caderno detectado: ${bookletDetection.code}. Modelo escolhido automaticamente.`;
+      const shouldRunOcr =
+        ocrAssistEnabled && !pendingScan && (!lotTemplate?.bookletCode || lotTemplate.family === "PROEA Anos Finais 2026");
+
+      if (shouldRunOcr) {
+        setBusyMessage("Identificando o codigo do caderno...");
+        bookletDetection = await detectBookletCodeFromCanvas(canvas);
       }
-    }
 
-    if (!templateForAnalysis) {
-      throw new Error("Nao foi possivel definir o modelo de leitura para este lote.");
-    }
-
-    const normalizedCanvas = await normalizeCanvasWithOpenCv(canvas, templateForAnalysis);
-    setBusyMessage("Detectando o retangulo exato do campo do gabarito...");
-    const detectedAnswerRegion = detectInkBoundingRegion(
-      normalizedCanvas,
-      templateForAnalysis.region,
-      templateForAnalysis.questionCount === 27
-        ? {
-            expandX: 0.035,
-            expandY: 0.045,
-            minRowInk: 0.055,
-            minColInk: 0.05,
-            minWidthRatio: 0.62,
-            minHeightRatio: 0.7,
-            padX: 0.008,
-            padY: 0.01
-          }
-        : {
-            expandX: 0.04,
-            expandY: 0.04,
-            minRowInk: 0.055,
-            minColInk: 0.05,
-            minWidthRatio: 0.72,
-            minHeightRatio: 0.62,
-            padX: 0.008,
-            padY: 0.01
-          }
-    );
-    setBusyMessage("Recortando apenas o campo detectado do gabarito...");
-    const answerRegionCanvas = cropCanvasToRegion(normalizedCanvas, detectedAnswerRegion);
-    const imageData = getImageData(answerRegionCanvas);
-    const worker = await getScanWorker();
-    setBusyMessage("Lendo regioes de resposta do modelo calibrado...");
-    const analysis = await worker.analyze({
-      pixels: imageData.data,
-      width: imageData.width,
-      height: imageData.height,
-      template: {
-        ...templateForAnalysis,
-        region: {
-          x: 0,
-          y: 0,
-          width: 1,
-          height: 1
+      if (bookletDetection.code && selectedLot.templateId) {
+        const matchedTemplate = templates.find((template) => template.bookletCode === bookletDetection.code);
+        if (matchedTemplate && lotTemplate?.bookletCode === bookletDetection.code) {
+          templateForAnalysis = matchedTemplate;
+          nextNotice = `Codigo do caderno detectado: ${bookletDetection.code}. Modelo confirmado automaticamente.`;
+        } else if (matchedTemplate && lotTemplate?.bookletCode && lotTemplate.bookletCode !== bookletDetection.code) {
+          nextNotice = `Codigo detectado ${bookletDetection.code}, mas o lote ativo espera ${lotTemplate.bookletCode}. Mantendo o modelo do lote para evitar correcao errada.`;
+        } else if (matchedTemplate && !lotTemplate?.bookletCode) {
+          templateForAnalysis = matchedTemplate;
+          nextNotice = `Codigo do caderno detectado: ${bookletDetection.code}. Modelo escolhido automaticamente.`;
         }
       }
-    });
-    const score = scoreAnswers(analysis.detectedAnswers, selectedLot.answerKey);
-    const nextPending: PendingScan = {
-      lot: selectedLot,
-      template: templateForAnalysis,
-      detectedBookletCode: bookletDetection.code ?? undefined,
-      imageUrl: dataUrl,
-      normalizedImage: canvasToDataUrl(answerRegionCanvas),
-      detectedAnswers: analysis.detectedAnswers,
-      finalAnswers: [...analysis.detectedAnswers],
-      ambiguousQuestions: analysis.ambiguousQuestions,
-      blanks: analysis.blanks,
-      correctCount: score.correctCount,
-      percent: score.percent,
-      confidence: analysis.confidence
-    };
-    setPendingScan(nextPending);
-    setBusyMessage("");
-    setNotice(nextNotice);
-    setGuideStatus("idle");
-    setCaptureMessage("Leitura pronta. Revise e confirme o aluno.");
+
+      if (!templateForAnalysis) {
+        throw new Error("Nao foi possivel definir o modelo de leitura para este lote.");
+      }
+
+      const normalizedCanvas = await normalizeCanvasWithOpenCv(canvas, templateForAnalysis);
+      setBusyMessage("Detectando o retangulo exato do campo do gabarito...");
+      const detectedAnswerRegion = detectInkBoundingRegion(
+        normalizedCanvas,
+        templateForAnalysis.region,
+        templateForAnalysis.questionCount === 27
+          ? {
+              expandX: 0.035,
+              expandY: 0.045,
+              minRowInk: 0.055,
+              minColInk: 0.05,
+              minWidthRatio: 0.62,
+              minHeightRatio: 0.7,
+              padX: 0.008,
+              padY: 0.01
+            }
+          : {
+              expandX: 0.04,
+              expandY: 0.04,
+              minRowInk: 0.055,
+              minColInk: 0.05,
+              minWidthRatio: 0.72,
+              minHeightRatio: 0.62,
+              padX: 0.008,
+              padY: 0.01
+            }
+      );
+      setBusyMessage("Recortando apenas o campo detectado do gabarito...");
+      const answerRegionCanvas = cropCanvasToRegion(normalizedCanvas, detectedAnswerRegion);
+      const imageData = getImageData(answerRegionCanvas);
+      const worker = await getScanWorker();
+      setBusyMessage("Lendo regioes de resposta do modelo calibrado...");
+      const analysis = await worker.analyze({
+        pixels: imageData.data,
+        width: imageData.width,
+        height: imageData.height,
+        template: {
+          ...templateForAnalysis,
+          region: {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1
+          }
+        }
+      });
+      const score = scoreAnswers(analysis.detectedAnswers, selectedLot.answerKey);
+      const nextPending: PendingScan = {
+        lot: selectedLot,
+        template: templateForAnalysis,
+        detectedBookletCode: bookletDetection.code ?? undefined,
+        imageUrl: dataUrl,
+        normalizedImage: canvasToDataUrl(answerRegionCanvas),
+        detectedAnswers: analysis.detectedAnswers,
+        finalAnswers: [...analysis.detectedAnswers],
+        ambiguousQuestions: analysis.ambiguousQuestions,
+        blanks: analysis.blanks,
+        correctCount: score.correctCount,
+        percent: score.percent,
+        confidence: analysis.confidence
+      };
+      setPendingScan(nextPending);
+      setBusyMessage("");
+      setNotice(nextNotice);
+      setGuideStatus("idle");
+      setCaptureMessage("Leitura pronta. Revise e confirme o aluno.");
+    } finally {
+      autoCaptureBusyRef.current = false;
+    }
   }
 
   async function handleCaptureFromCamera() {
@@ -1033,6 +1061,17 @@ export default function App() {
                 <span>{autoCaptureEnabled ? "Ligada" : "Desligada"}</span>
               </label>
             </div>
+            <div>
+              <strong>OCR do caderno</strong>
+              <label className="switch-row">
+                <input
+                  type="checkbox"
+                  checked={ocrAssistEnabled}
+                  onChange={(event) => setOcrAssistEnabled(event.target.checked)}
+                />
+                <span>{ocrAssistEnabled ? "Ligado" : "Desligado"}</span>
+              </label>
+            </div>
           </div>
 
           <div className="capture-toolbar">
@@ -1082,7 +1121,7 @@ export default function App() {
             {cameraError ? <p className="error">{cameraError}</p> : null}
             {busyMessage ? <p className="hint">{busyMessage}</p> : null}
             <p className="hint">
-              Posicione o gabarito inteiro dentro da moldura. Quando o app detectar estabilidade e alinhamento, ele fotografa sozinho.
+              Posicione o gabarito inteiro dentro da moldura. Para mais estabilidade no iPhone, comece com auto captura desligada e OCR desligado.
             </p>
           </div>
 

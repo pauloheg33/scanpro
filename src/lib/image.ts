@@ -20,7 +20,7 @@ export async function imageUrlToImageElement(url: string) {
   });
 }
 
-export async function drawImageToCanvas(url: string, maxWidth = 1600) {
+export async function drawImageToCanvas(url: string, maxWidth = 1280) {
   const image = await imageUrlToImageElement(url);
   const scale = Math.min(1, maxWidth / image.width);
   const canvas = document.createElement("canvas");
