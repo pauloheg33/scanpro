@@ -15,6 +15,7 @@ import { getScanWorker } from "./lib/scan-worker-client";
 import { useAppStore } from "./store/useAppStore";
 import type {
   AlternativeLabel,
+  BookletDetection,
   Lot,
   PendingScan,
   ScanRecord,
@@ -268,6 +269,9 @@ export default function App() {
         }).finally(() => {
           stableFrameCountRef.current = 0;
           autoCaptureBusyRef.current = false;
+          if (cameraState === "live" && autoCaptureEnabled && !pendingScan) {
+            autoCaptureFrameRef.current = requestAnimationFrame(loop);
+          }
         });
         return;
       }
@@ -438,16 +442,25 @@ export default function App() {
     setBusyMessage("Preparando imagem e aplicando normalizacao...");
     const canvas = await drawImageToCanvas(dataUrl);
     let templateForAnalysis = selectedTemplate;
+    let nextNotice = "";
 
-    setBusyMessage("Identificando o codigo do caderno...");
-    const bookletDetection = await detectBookletCodeFromCanvas(canvas);
-    if (bookletDetection.code) {
-      const matchedTemplate = templates.find(
-        (template) => template.bookletCode === bookletDetection.code
-      );
-      if (matchedTemplate) {
+    let bookletDetection: BookletDetection = { code: null, rawText: "" };
+    if (selectedTemplate?.bookletCode || templates.some((template) => template.bookletCode)) {
+      setBusyMessage("Identificando o codigo do caderno...");
+      bookletDetection = await detectBookletCodeFromCanvas(canvas);
+    }
+
+    if (bookletDetection.code && selectedLot.templateId) {
+      const matchedTemplate = templates.find((template) => template.bookletCode === bookletDetection.code);
+      const lotTemplate = templates.find((template) => template.id === selectedLot.templateId) ?? null;
+      if (matchedTemplate && lotTemplate?.bookletCode === bookletDetection.code) {
         templateForAnalysis = matchedTemplate;
-        setNotice(`Codigo do caderno detectado: ${bookletDetection.code}. Modelo escolhido automaticamente.`);
+        nextNotice = `Codigo do caderno detectado: ${bookletDetection.code}. Modelo confirmado automaticamente.`;
+      } else if (matchedTemplate && lotTemplate?.bookletCode && lotTemplate.bookletCode !== bookletDetection.code) {
+        nextNotice = `Codigo detectado ${bookletDetection.code}, mas o lote ativo espera ${lotTemplate.bookletCode}. Mantendo o modelo do lote para evitar correcao errada.`;
+      } else if (matchedTemplate && !lotTemplate?.bookletCode) {
+        templateForAnalysis = matchedTemplate;
+        nextNotice = `Codigo do caderno detectado: ${bookletDetection.code}. Modelo escolhido automaticamente.`;
       }
     }
 
@@ -482,7 +495,7 @@ export default function App() {
     };
     setPendingScan(nextPending);
     setBusyMessage("");
-    setNotice("");
+    setNotice(nextNotice);
     setGuideStatus("idle");
     setCaptureMessage("Leitura pronta. Revise e confirme o aluno.");
   }

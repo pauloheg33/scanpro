@@ -42,9 +42,14 @@ export async function detectBookletCodeFromCanvas(
   context.drawImage(canvas, 0, 0, canvas.width, crop.height, 0, 0, crop.width, crop.height);
 
   try {
-    const result = await tesseract.recognize(crop, "eng", {
-      logger: () => undefined
-    });
+    const result = await Promise.race([
+      tesseract.recognize(crop, "eng", {
+        logger: () => undefined
+      }),
+      new Promise<never>((_, reject) => {
+        window.setTimeout(() => reject(new Error("OCR timeout")), 3500);
+      })
+    ]);
     const rawText = result.data.text ?? "";
     return {
       code: extractBookletCode(rawText),
